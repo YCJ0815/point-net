@@ -6,6 +6,13 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    from .numpy_npz_compat import install_numpy_pickle_compat
+except ImportError:
+    from numpy_npz_compat import install_numpy_pickle_compat
+
+install_numpy_pickle_compat()
+
 
 PYBULLET_PYTHON = "/Users/ycj/miniconda3/envs/pybullet/bin/python"
 
@@ -279,8 +286,8 @@ def solve_one_pose(
 
 def save_results(output_path, input_sample, robot_info, payload):
     save_kwargs = {
-        "source_tcp_npz": np.array(str(input_sample["path"]), dtype=object),
-        "joint_names": np.asarray(robot_info["movable_joint_names"], dtype=object),
+        "source_tcp_npz": np.array(str(input_sample["path"]), dtype=str),
+        "joint_names": np.asarray(robot_info["movable_joint_names"], dtype=str),
         "joint_lower_limits": robot_info["lower_limits"].astype(np.float32),
         "joint_upper_limits": robot_info["upper_limits"].astype(np.float32),
         "tcp_points": input_sample["tcp_points"].astype(np.float32),

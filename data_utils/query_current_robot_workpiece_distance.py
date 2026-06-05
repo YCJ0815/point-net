@@ -5,6 +5,13 @@ from pathlib import Path
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
+try:
+    from .numpy_npz_compat import install_numpy_pickle_compat
+except ImportError:
+    from numpy_npz_compat import install_numpy_pickle_compat
+
+install_numpy_pickle_compat()
+
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.append(str(BASE_DIR))

@@ -2,6 +2,13 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+
+try:
+    from .numpy_npz_compat import install_numpy_pickle_compat
+except ImportError:
+    from numpy_npz_compat import install_numpy_pickle_compat
+
+install_numpy_pickle_compat()
 import trimesh
 from scipy.interpolate import RegularGridInterpolator
 from scipy.spatial import cKDTree
@@ -235,7 +242,7 @@ def generate_tcp_points_from_point_cloud(
         "anchor_points": anchor_points[order],
         "surface_normals": surface_normals[order],
         "surface_distance": surface_distance[order],
-        "band": np.array(["near"] * len(tcp_points), dtype=object),
+        "band": np.array(["near"] * len(tcp_points), dtype=str),
         "num_points": int(len(tcp_points)),
         "near_count": int(len(tcp_points)),
         "far_count": 0,
@@ -400,7 +407,7 @@ def generate_tcp_points_from_roi_capsule(
         "surface_normals": surface_normals[order],
         "surface_distance": surface_distance[order],
         "capsule_boundary_distance": boundary_distance[order],
-        "band": np.array(["roi_capsule_far"] * len(tcp_points), dtype=object),
+        "band": np.array(["roi_capsule_far"] * len(tcp_points), dtype=str),
         "num_points": int(len(tcp_points)),
         "near_count": 0,
         "far_count": int(len(tcp_points)),
@@ -480,7 +487,7 @@ def save_npz(output_path, sample_dict, sdf_meta):
         "num_points": np.array(sample_dict["num_points"], dtype=np.int64),
         "near_count": np.array(sample_dict["near_count"], dtype=np.int64),
         "far_count": np.array(sample_dict["far_count"], dtype=np.int64),
-        "sampling_mode": np.array(sample_dict["sampling_mode"], dtype=object),
+        "sampling_mode": np.array(sample_dict["sampling_mode"], dtype=str),
         "point_cloud_bounds": sample_dict["point_cloud_bounds"],
         "orientation_matrices": sample_dict["orientation_matrices"],
         "orientation_quaternions_xyzw": sample_dict["orientation_quaternions_xyzw"],

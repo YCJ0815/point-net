@@ -3,6 +3,13 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    from .numpy_npz_compat import install_numpy_pickle_compat
+except ImportError:
+    from numpy_npz_compat import install_numpy_pickle_compat
+
+install_numpy_pickle_compat()
+
 
 DEFAULT_RESULTS_ROOT = "/Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/results"
 DEFAULT_OUTPUT_ROOT = "data/noisy_transition_joint_trajectories"
@@ -68,7 +75,7 @@ def save_noisy_transition(output_path, trajectory_payload, noisy_trajectory, noi
         "noise_sigma": np.array(sigma, dtype=np.float32),
         "noise_clip_min": np.array(clip_min, dtype=np.float32),
         "noise_clip_max": np.array(clip_max, dtype=np.float32),
-        "source_transition_npz": np.array(str(Path(source_npz).resolve()), dtype=object),
+        "source_transition_npz": np.array(str(Path(source_npz).resolve()), dtype=str),
     }
     if trajectory_payload["q_start"] is not None:
         save_kwargs["q_start"] = trajectory_payload["q_start"].astype(np.float32)

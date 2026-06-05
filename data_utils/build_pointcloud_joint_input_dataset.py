@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 try:
+    from .numpy_npz_compat import install_numpy_pickle_compat
     from .query_current_robot_workpiece_distance import RobotWorkpieceDistanceQuery
     from .extract_transition_pointcloud_roi import (
         crop_xy_radius_height_point_cloud,
@@ -14,6 +15,7 @@ try:
         sample_mesh_surface,
     )
 except ImportError:
+    from numpy_npz_compat import install_numpy_pickle_compat
     from query_current_robot_workpiece_distance import RobotWorkpieceDistanceQuery
     from extract_transition_pointcloud_roi import (
         crop_xy_radius_height_point_cloud,
@@ -21,6 +23,8 @@ except ImportError:
         load_transformed_mesh_world,
         sample_mesh_surface,
     )
+
+install_numpy_pickle_compat()
 
 
 DEFAULT_RESULTS_ROOT = "/Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/results"
@@ -487,10 +491,10 @@ def build_dataset(args):
                 "q_start": concatenate_or_empty(q_start, (0, 6), np.float32),
                 "q_sample": concatenate_or_empty(q_sample, (0, 6), np.float32),
                 "delta_q": concatenate_or_empty(delta_q, (0, 6), np.float32),
-                "joint_source": np.asarray(joint_source, dtype=object),
-                "source_transition_npz": np.asarray(source_transition_npz, dtype=object),
-                "source_joint_npz": np.asarray(source_joint_npz, dtype=object),
-                "source_workpiece_stl": np.asarray(source_workpiece_stl, dtype=object),
+                "joint_source": np.asarray(joint_source, dtype=str),
+                "source_transition_npz": np.asarray(source_transition_npz, dtype=str),
+                "source_joint_npz": np.asarray(source_joint_npz, dtype=str),
+                "source_workpiece_stl": np.asarray(source_workpiece_stl, dtype=str),
                 "joint_limits_lower": joint_limits_lower.astype(np.float32),
                 "joint_limits_upper": joint_limits_upper.astype(np.float32),
                 "canonical_start_tf": concatenate_or_empty(canonical_start_tf, (0, 4, 4), np.float32),

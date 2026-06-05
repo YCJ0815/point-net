@@ -1,6 +1,13 @@
 import numpy as np
 
 try:
+    from .numpy_npz_compat import install_numpy_pickle_compat
+except ImportError:
+    from numpy_npz_compat import install_numpy_pickle_compat
+
+install_numpy_pickle_compat()
+
+try:
     from torch.utils.data import Dataset
 except ModuleNotFoundError:
     class Dataset:

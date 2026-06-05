@@ -7,6 +7,13 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
+try:
+    from .numpy_npz_compat import install_numpy_pickle_compat
+except ImportError:
+    from numpy_npz_compat import install_numpy_pickle_compat
+
+install_numpy_pickle_compat()
+
 
 def parse_xyz(text):
     if text is None:
@@ -195,7 +202,7 @@ class URDFSurfaceSampler:
             raise ValueError("No collision geometry found in the selected links.")
 
         merged = trimesh.util.concatenate(meshes)
-        return merged, np.array(face_link_names, dtype=object)
+        return merged, np.array(face_link_names, dtype=str)
 
     def build_link_meshes(self, joint_values=None, include_links=None):
         joint_values = joint_values or {}
@@ -363,7 +370,7 @@ def sample_surface_points_per_link(link_meshes, count, min_points_per_link=32, s
         "points": points,
         "normals": normals,
         "face_index": np.full(len(points), -1, dtype=np.int64),
-        "link_name": np.array(all_link_names, dtype=object),
+        "link_name": np.array(all_link_names, dtype=str),
         "target_count": int(count),
         "actual_count": int(len(points)),
         "surface_area": float(sum(mesh.area for mesh in link_meshes.values())),
@@ -382,7 +389,7 @@ def transform_points_with_matrix(points, normals, matrix):
 
 
 def convert_link_local_sample_to_world(sample_dict, sampler, joint_values):
-    link_names = np.asarray(sample_dict["link_name"], dtype=object)
+    link_names = np.asarray(sample_dict["link_name"], dtype=str)
     local_points = np.asarray(sample_dict["points"], dtype=np.float32)
     local_normals = np.asarray(sample_dict["normals"], dtype=np.float32)
     world_points = np.empty_like(local_points)
@@ -451,7 +458,7 @@ def load_sample_dict(path):
         "points": np.asarray(data["points"], dtype=np.float32),
         "normals": np.asarray(data["normals"], dtype=np.float32),
         "face_index": np.asarray(data["face_index"], dtype=np.int64),
-        "link_name": np.asarray(data["link_name"], dtype=object),
+        "link_name": np.asarray(data["link_name"], dtype=str),
         "target_count": int(np.asarray(data["target_count"]).item()),
         "actual_count": int(np.asarray(data["actual_count"]).item()),
         "surface_area": float(np.asarray(data["surface_area"]).item()),
