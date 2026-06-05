@@ -7,12 +7,24 @@ import numpy as np
 
 try:
     from .query_current_robot_workpiece_distance import RobotWorkpieceDistanceQuery
+    from .extract_transition_pointcloud_roi import (
+        crop_xy_radius_height_point_cloud,
+        farthest_point_sampling_numpy,
+        load_transformed_mesh_world,
+        sample_mesh_surface,
+    )
 except ImportError:
     from query_current_robot_workpiece_distance import RobotWorkpieceDistanceQuery
+    from extract_transition_pointcloud_roi import (
+        crop_xy_radius_height_point_cloud,
+        farthest_point_sampling_numpy,
+        load_transformed_mesh_world,
+        sample_mesh_surface,
+    )
 
 
 DEFAULT_RESULTS_ROOT = "/Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/results"
-DEFAULT_SDF_ROOT = "/Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/jobs"
+DEFAULT_JOBS_ROOT = "/Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/jobs"
 DEFAULT_URDF = "config/robot-model/ur5e_with_pen.urdf"
 DEFAULT_LOCAL_POINTS = "config/robot-model/ur5e_surface_points_local.npz"
 DEFAULT_JOINT_NAMES = (
@@ -54,64 +66,27 @@ def find_job_dir(root, job_name):
     return nested
 
 
-def collect_roi_files(roi_root, job_name=None, transition_name=None):
-    roi_dir = find_job_dir(roi_root, job_name)
-    if not roi_dir.is_dir():
-        raise FileNotFoundError(f"ROI directory does not exist: {roi_dir}")
-
-    if transition_name is not None:
-        patterns = [f"{transition_name}*roi*.npz", f"{transition_name}.npz"]
+def collect_transition_files(results_root, job_name=None, transition_name=None):
+    results_root = Path(results_root).resolve()
+    if job_name is not None:
+        job_dirs = [find_job_dir(results_root, job_name)]
     else:
-        patterns = ["transition_*roi*.npz", "transition_*.npz"]
+        job_dirs = sorted(path for path in results_root.glob("job_*") if path.is_dir())
 
-    seen = set()
-    roi_files = []
-    for pattern in patterns:
-        for path in sorted(roi_dir.glob(pattern)):
-            if path in seen:
-                continue
-            seen.add(path)
-            try:
-                with np.load(path, allow_pickle=True) as data:
-                    if "point_cloud" in data:
-                        roi_files.append(path)
-            except Exception:
-                continue
+    transition_files = []
+    for job_dir in job_dirs:
+        if not job_dir.is_dir():
+            continue
+        if transition_name is None:
+            transition_files.extend(sorted(job_dir.glob("transition_*.npz")))
+        else:
+            transition_path = job_dir / f"{transition_name}.npz"
+            if transition_path.is_file():
+                transition_files.append(transition_path)
 
-    if not roi_files:
-        raise FileNotFoundError(f"No ROI npz files with a point_cloud field found under: {roi_dir}")
-    return roi_files
-
-
-def farthest_point_sampling(points, num_points, rng):
-    points = np.asarray(points, dtype=np.float32)
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError(f"point_cloud must have shape [N, 3], got {points.shape}")
-    if num_points <= 0:
-        raise ValueError(f"num_points must be positive, got {num_points}")
-    if len(points) == 0:
-        raise ValueError("Cannot sample an empty point cloud.")
-
-    if len(points) == 1:
-        return np.repeat(points, num_points, axis=0).astype(np.float32)
-    if len(points) <= num_points:
-        repeat_count = num_points - len(points)
-        if repeat_count == 0:
-            return points.astype(np.float32)
-        repeat_indices = rng.integers(0, len(points), size=repeat_count)
-        return np.concatenate([points, points[repeat_indices]], axis=0).astype(np.float32)
-
-    selected_indices = np.zeros(num_points, dtype=np.int64)
-    distances = np.full(len(points), np.inf, dtype=np.float32)
-    selected_indices[0] = int(rng.integers(0, len(points)))
-
-    for i in range(1, num_points):
-        last_point = points[selected_indices[i - 1]]
-        current_distances = np.sum((points - last_point[None, :]) ** 2, axis=1)
-        distances = np.minimum(distances, current_distances)
-        selected_indices[i] = int(np.argmax(distances))
-
-    return points[selected_indices].astype(np.float32)
+    if not transition_files:
+        raise FileNotFoundError("No transition npz files matched the provided filters.")
+    return transition_files
 
 
 def canonicalize_axis_symmetric_tcp_transform(tcp_transform):
@@ -207,30 +182,18 @@ def build_joint_features(q_start, q_samples, lower, upper):
 
 def load_transition_npz(transition_path):
     transition_path = Path(transition_path).resolve()
-    data = np.load(transition_path, allow_pickle=True)
-    required = ("start_tf", "q_start")
-    missing = [key for key in required if key not in data]
-    if missing:
-        raise KeyError(f"Transition npz missing required fields {missing}: {transition_path}")
-    start_tf = np.asarray(data["start_tf"], dtype=np.float32)
-    q_start = np.asarray(data["q_start"], dtype=np.float32).reshape(6)
-    return {"path": transition_path, "start_tf": start_tf, "q_start": q_start}
-
-
-def infer_transition_path(roi_path, roi_data, results_root, job_name):
-    if "source_transition" in roi_data:
-        source_transition = Path(scalar_string(roi_data["source_transition"])).expanduser()
-        if source_transition.is_file():
-            return source_transition.resolve()
-
-    transition_stem = infer_transition_stem(roi_path)
-    transition_path = Path(results_root).resolve()
-    if job_name is not None:
-        transition_path = transition_path / job_name
-    transition_path = transition_path / f"{transition_stem}.npz"
-    if not transition_path.is_file():
-        raise FileNotFoundError(f"Cannot locate transition npz for {roi_path}: {transition_path}")
-    return transition_path.resolve()
+    with np.load(transition_path, allow_pickle=True) as data:
+        required = ("start_tf", "q_start", "start_xyz", "end_xyz")
+        missing = [key for key in required if key not in data]
+        if missing:
+            raise KeyError(f"Transition npz missing required fields {missing}: {transition_path}")
+        return {
+            "path": transition_path,
+            "start_tf": np.asarray(data["start_tf"], dtype=np.float32),
+            "q_start": np.asarray(data["q_start"], dtype=np.float32).reshape(6),
+            "start_xyz": np.asarray(data["start_xyz"], dtype=np.float32).reshape(3),
+            "end_xyz": np.asarray(data["end_xyz"], dtype=np.float32).reshape(3),
+        }
 
 
 def candidate_dir_for_root(root, job_name):
@@ -294,13 +257,26 @@ def load_joint_samples_from_source(source_path, source_kind):
     return q_samples, joint_names
 
 
-def resolve_sdf_path(sdf_root, transition_path):
+def resolve_job_assets(jobs_root, transition_path):
     job_name = Path(transition_path).resolve().parent.name
-    sdf_dir = find_job_dir(sdf_root, job_name)
-    sdf_path = sdf_dir / "workpiece_sdf.npz"
+    job_dir = find_job_dir(jobs_root, job_name)
+    stl_path = job_dir / "workpiece.stl"
+    sdf_path = job_dir / "workpiece_sdf.npz"
+    if not stl_path.is_file():
+        raise FileNotFoundError(f"Cannot find workpiece STL for {transition_path}: {stl_path}")
     if not sdf_path.is_file():
         raise FileNotFoundError(f"Cannot find workpiece SDF for {transition_path}: {sdf_path}")
-    return sdf_path.resolve()
+    return job_dir.resolve(), stl_path.resolve(), sdf_path.resolve()
+
+
+def load_job_surface_points(job_dir, stl_path, args):
+    mesh = load_transformed_mesh_world(stl_path=stl_path, job_dir=job_dir)
+    return sample_mesh_surface(
+        mesh=mesh,
+        num_points=args.num_mesh_sample_points,
+        use_even=args.use_even_sampling,
+        seed=args.seed,
+    )
 
 
 def build_distance_targets(min_signed_distance):
@@ -310,95 +286,109 @@ def build_distance_targets(min_signed_distance):
     return collision_labels, min_distance_norm
 
 
-def process_one_roi(
-    roi_path,
+def process_one_transition(
+    transition_path,
+    job_surface_points,
+    stl_path,
+    sdf_path,
     args,
     joint_limits_lower,
     joint_limits_upper,
     distance_query,
-    rng,
 ):
-    with np.load(roi_path, allow_pickle=True) as roi_data:
-        transition_path = infer_transition_path(
-            roi_path=roi_path,
-            roi_data=roi_data,
-            results_root=args.results_root,
-            job_name=args.job_name,
-        )
-        points_world = np.asarray(roi_data["point_cloud"], dtype=np.float32)
-
     transition = load_transition_npz(transition_path)
-    sdf_path = resolve_sdf_path(args.sdf_root, transition_path)
-    points_world_512 = farthest_point_sampling(points_world, args.num_points, rng)
-    canonical_start_tf = canonicalize_axis_symmetric_tcp_transform(transition["start_tf"])
-    points_tcp = world_to_tcp_points(points_world_512, canonical_start_tf)
-    point_cloud_input = (points_tcp / float(args.point_scale)).astype(np.float32)
-
     transition_stem = infer_transition_stem(transition_path)
+    job_name = Path(transition_path).resolve().parent.name
     source_specs = [
         ("ik_near", args.ik_near_root, "ik_solutions"),
         ("ik_far", args.ik_far_root, "ik_solutions"),
         ("noisy_playback", args.noisy_root, "q_playback_noisy"),
     ]
+    matched_sources = []
+    for source_kind, source_root, required_key in source_specs:
+        for source_path in find_source_files(source_root, job_name, transition_stem, required_key, source_kind):
+            matched_sources.append((source_kind, source_path))
+
+    if not matched_sources:
+        return {
+            "transition_path": str(transition_path),
+            "stl_path": str(stl_path),
+            "blocks": [],
+            "failures": [],
+            "skipped_invalid_distance": 0,
+        }
+
+    cropped_points_world = crop_xy_radius_height_point_cloud(
+        points=job_surface_points,
+        start=transition["start_xyz"],
+        goal=transition["end_xyz"],
+        radius=args.radius_m,
+        height=args.height_m,
+    )
+    points_world_512 = farthest_point_sampling_numpy(
+        cropped_points_world,
+        num_points=args.num_points,
+        seed=args.seed,
+    )
+    canonical_start_tf = canonicalize_axis_symmetric_tcp_transform(transition["start_tf"])
+    points_tcp = world_to_tcp_points(points_world_512, canonical_start_tf)
+    point_cloud_input = (points_tcp / float(args.point_scale)).astype(np.float32)
 
     blocks = []
     failures = []
     skipped_invalid_distance = 0
-    for source_kind, source_root, required_key in source_specs:
-        for source_path in find_source_files(source_root, args.job_name, transition_stem, required_key, source_kind):
-            try:
-                q_samples, source_joint_names = load_joint_samples_from_source(source_path, source_kind)
-                distance_result = distance_query.query_joint_values(
-                    joint_values=q_samples,
-                    sdf_path=sdf_path,
-                    joint_names=source_joint_names,
-                    outside_mode=args.outside_mode,
-                    progress_every=args.distance_progress_every,
-                )
-                min_signed_distance = distance_result["min_signed_distance"]
-                valid_mask = np.isfinite(min_signed_distance)
-                skipped_invalid_distance += int(np.sum(~valid_mask))
-                if not np.any(valid_mask):
-                    continue
+    for source_kind, source_path in matched_sources:
+        try:
+            q_samples, source_joint_names = load_joint_samples_from_source(source_path, source_kind)
+            distance_result = distance_query.query_joint_values(
+                joint_values=q_samples,
+                sdf_path=sdf_path,
+                joint_names=source_joint_names,
+                outside_mode=args.outside_mode,
+                progress_every=args.distance_progress_every,
+            )
+            min_signed_distance = distance_result["min_signed_distance"]
+            valid_mask = np.isfinite(min_signed_distance)
+            skipped_invalid_distance += int(np.sum(~valid_mask))
+            if not np.any(valid_mask):
+                continue
 
-                source_indices = np.flatnonzero(valid_mask).astype(np.int32)
-                q_samples = q_samples[valid_mask]
-                min_signed_distance = min_signed_distance[valid_mask]
-                joint_features, q_start_tiled, delta_q = build_joint_features(
-                    q_start=transition["q_start"],
-                    q_samples=q_samples,
-                    lower=joint_limits_lower,
-                    upper=joint_limits_upper,
+            source_indices = np.flatnonzero(valid_mask).astype(np.int32)
+            q_samples = q_samples[valid_mask]
+            min_signed_distance = min_signed_distance[valid_mask]
+            joint_features, q_start_tiled, delta_q = build_joint_features(
+                q_start=transition["q_start"],
+                q_samples=q_samples,
+                lower=joint_limits_lower,
+                upper=joint_limits_upper,
+            )
+            collision_labels, min_distance_norm = build_distance_targets(min_signed_distance)
+            count = q_samples.shape[0]
+            block = {
+                "joint_features": joint_features.astype(np.float32),
+                "point_clouds": np.repeat(point_cloud_input[None, :, :], count, axis=0).astype(np.float32),
+                "collision_labels": collision_labels,
+                "min_distance_norm": min_distance_norm,
+            }
+            if args.save_metadata:
+                block.update(
+                    {
+                        "source_kind": source_kind,
+                        "source_path": str(source_path),
+                        "q_sample": q_samples.astype(np.float32),
+                        "q_start": q_start_tiled.astype(np.float32),
+                        "delta_q": delta_q.astype(np.float32),
+                        "canonical_start_tf": np.repeat(canonical_start_tf[None, :, :], count, axis=0).astype(np.float32),
+                        "source_indices": source_indices,
+                    }
                 )
-                collision_labels, min_distance_norm = build_distance_targets(min_signed_distance)
-                count = q_samples.shape[0]
-                block = {
-                    "joint_features": joint_features.astype(np.float32),
-                    "point_clouds": np.repeat(point_cloud_input[None, :, :], count, axis=0).astype(np.float32),
-                    "collision_labels": collision_labels,
-                    "min_distance_norm": min_distance_norm,
-                }
-                if args.save_metadata:
-                    block.update(
-                        {
-                            "source_kind": source_kind,
-                            "source_path": str(source_path),
-                            "q_sample": q_samples.astype(np.float32),
-                            "q_start": q_start_tiled.astype(np.float32),
-                            "delta_q": delta_q.astype(np.float32),
-                            "canonical_start_tf": np.repeat(canonical_start_tf[None, :, :], count, axis=0).astype(np.float32),
-                            "source_indices": source_indices,
-                        }
-                    )
-                blocks.append(block)
-            except Exception as exc:
-                failures.append((str(source_path), str(exc)))
+            blocks.append(block)
+        except Exception as exc:
+            failures.append((str(source_path), str(exc)))
 
     return {
-        "roi_path": str(Path(roi_path).resolve()),
         "transition_path": str(transition_path),
-        "point_cloud_input": point_cloud_input,
-        "canonical_start_tf": canonical_start_tf,
+        "stl_path": str(stl_path),
         "blocks": blocks,
         "failures": failures,
         "skipped_invalid_distance": skipped_invalid_distance,
@@ -413,8 +403,7 @@ def concatenate_or_empty(arrays, shape, dtype):
 
 def build_dataset(args):
     joint_limits_lower, joint_limits_upper = parse_urdf_joint_limits(args.urdf)
-    roi_files = collect_roi_files(args.roi_root, args.job_name, args.transition_name)
-    rng = np.random.default_rng(args.seed)
+    transition_files = collect_transition_files(args.results_root, args.job_name, args.transition_name)
     distance_query = RobotWorkpieceDistanceQuery(
         urdf_path=args.urdf,
         local_points_path=args.local_points,
@@ -435,24 +424,35 @@ def build_dataset(args):
         joint_source = []
         source_transition_npz = []
         source_joint_npz = []
-        source_roi_npz = []
+        source_workpiece_stl = []
         transition_index = []
         joint_index_in_source = []
     failures = []
     skipped_invalid_distance = 0
+    job_surface_cache = {}
 
-    processed_roi = 0
-    for roi_index, roi_path in enumerate(roi_files):
+    processed_transitions = 0
+    for transition_index_value, transition_path in enumerate(transition_files):
         try:
-            result = process_one_roi(
-                roi_path=roi_path,
+            job_dir, stl_path, sdf_path = resolve_job_assets(args.jobs_root, transition_path)
+            if job_dir not in job_surface_cache:
+                job_surface_cache[job_dir] = load_job_surface_points(job_dir, stl_path, args)
+                print(
+                    f"sampled_workpiece_surface: {job_dir.name} | "
+                    f"points: {len(job_surface_cache[job_dir])}"
+                )
+
+            result = process_one_transition(
+                transition_path=transition_path,
+                job_surface_points=job_surface_cache[job_dir],
+                stl_path=stl_path,
+                sdf_path=sdf_path,
                 args=args,
                 joint_limits_lower=joint_limits_lower,
                 joint_limits_upper=joint_limits_upper,
                 distance_query=distance_query,
-                rng=rng,
             )
-            processed_roi += 1
+            processed_transitions += 1
             failures.extend(result["failures"])
             skipped_invalid_distance += result["skipped_invalid_distance"]
             for block in result["blocks"]:
@@ -469,11 +469,11 @@ def build_dataset(args):
                     joint_source.extend([block["source_kind"]] * count)
                     source_transition_npz.extend([result["transition_path"]] * count)
                     source_joint_npz.extend([block["source_path"]] * count)
-                    source_roi_npz.extend([result["roi_path"]] * count)
-                    transition_index.extend([roi_index] * count)
+                    source_workpiece_stl.extend([result["stl_path"]] * count)
+                    transition_index.extend([transition_index_value] * count)
                     joint_index_in_source.extend(block["source_indices"].tolist())
         except Exception as exc:
-            failures.append((str(roi_path), str(exc)))
+            failures.append((str(transition_path), str(exc)))
 
     dataset = {
         "point_clouds": concatenate_or_empty(point_clouds, (0, args.num_points, 3), np.float32),
@@ -490,7 +490,7 @@ def build_dataset(args):
                 "joint_source": np.asarray(joint_source, dtype=object),
                 "source_transition_npz": np.asarray(source_transition_npz, dtype=object),
                 "source_joint_npz": np.asarray(source_joint_npz, dtype=object),
-                "source_roi_npz": np.asarray(source_roi_npz, dtype=object),
+                "source_workpiece_stl": np.asarray(source_workpiece_stl, dtype=object),
                 "joint_limits_lower": joint_limits_lower.astype(np.float32),
                 "joint_limits_upper": joint_limits_upper.astype(np.float32),
                 "canonical_start_tf": concatenate_or_empty(canonical_start_tf, (0, 4, 4), np.float32),
@@ -507,8 +507,9 @@ def build_dataset(args):
     np.savez_compressed(output_path, **dataset)
 
     print(f"saved: {output_path}")
-    print(f"roi_files_found: {len(roi_files)}")
-    print(f"roi_files_processed: {processed_roi}")
+    print(f"transition_files_found: {len(transition_files)}")
+    print(f"transition_files_processed: {processed_transitions}")
+    print(f"workpiece_surfaces_sampled: {len(job_surface_cache)}")
     print(f"samples: {dataset['point_clouds'].shape[0]}")
     print(f"point_clouds: {dataset['point_clouds'].shape}")
     print(f"joint_features: {dataset['joint_features'].shape}")
@@ -525,17 +526,20 @@ def build_dataset(args):
 
 def main():
     parser = argparse.ArgumentParser("build_pointcloud_joint_input_dataset")
-    parser.add_argument("--roi-root", type=str, required=True, help="Root containing ROI npz files or job_xxx ROI subdirectories")
     parser.add_argument("--results-root", type=str, default=DEFAULT_RESULTS_ROOT, help="Root containing raw transition npz files")
+    parser.add_argument("--jobs-root", type=str, default=DEFAULT_JOBS_ROOT, help="Root containing job_xxx/workpiece.stl and workpiece_sdf.npz")
     parser.add_argument("--job-name", type=str, default=None, help="Optional job name, e.g. job_003")
     parser.add_argument("--transition-name", type=str, default=None, help="Optional transition stem, e.g. transition_0012_0053")
     parser.add_argument("--ik-near-root", type=str, default=None, help="Root containing near-surface IK npz files")
     parser.add_argument("--ik-far-root", type=str, default=None, help="Root containing far-field IK npz files")
     parser.add_argument("--noisy-root", type=str, default=None, help="Root containing q_playback_noisy npz files")
-    parser.add_argument("--sdf-root", type=str, default=DEFAULT_SDF_ROOT, help="Root containing job_xxx/workpiece_sdf.npz")
     parser.add_argument("--output", type=str, required=True, help="Output dataset npz path")
     parser.add_argument("--urdf", type=str, default=DEFAULT_URDF, help="Robot URDF path used for joint limits")
     parser.add_argument("--local-points", type=str, default=DEFAULT_LOCAL_POINTS, help="Link-local robot surface point cache; sampled in memory if missing")
+    parser.add_argument("--radius-m", type=float, default=0.1, help="XY capsule radius used for in-memory ROI cropping")
+    parser.add_argument("--height-m", type=float, default=0.1, help="ROI height measured from the workpiece minimum z")
+    parser.add_argument("--num-mesh-sample-points", type=int, default=100000, help="Dense workpiece surface points sampled once per job")
+    parser.add_argument("--use-even-sampling", action="store_true", help="Use trimesh even surface sampling for the workpiece")
     parser.add_argument("--num-points", type=int, default=512, help="Point count per sample after downsampling/padding")
     parser.add_argument("--point-scale", type=float, default=0.1, help="TCP-frame point cloud normalization divisor in meters")
     parser.add_argument("--distance-num-points", type=int, default=8192, help="Robot surface point count if local cache must be sampled in memory")
@@ -548,6 +552,12 @@ def main():
 
     if args.num_points <= 0:
         raise ValueError("--num-points must be positive.")
+    if args.radius_m <= 0:
+        raise ValueError("--radius-m must be positive.")
+    if args.height_m <= 0:
+        raise ValueError("--height-m must be positive.")
+    if args.num_mesh_sample_points <= 0:
+        raise ValueError("--num-mesh-sample-points must be positive.")
     if args.point_scale <= 0:
         raise ValueError("--point-scale must be positive.")
     if args.distance_num_points <= 0:

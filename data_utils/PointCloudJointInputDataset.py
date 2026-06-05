@@ -56,7 +56,7 @@ class PointCloudJointInputDataset(Dataset):
             "joint_source",
             "source_transition_npz",
             "source_joint_npz",
-            "source_roi_npz",
+            "source_workpiece_stl",
             "transition_index",
             "joint_index_in_source",
         ):

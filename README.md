@@ -46,26 +46,28 @@ Each final dataset sample contains:
 
 ### Build the Dataset
 
-The command below builds one final dataset for `job_003`. The ROI, near-field IK, far-field IK, and noisy expert trajectory roots must contain files with matching `transition_xxxx_xxxx` names.
+The command below builds one final dataset for `job_003`. ROI point clouds are cropped directly from `workpiece.stl` in memory and are not saved. The near-field IK, far-field IK, and noisy expert trajectory roots must contain files with matching `transition_xxxx_xxxx` names.
 
 ```shell
 python data_utils/build_pointcloud_joint_input_dataset.py \
-  --roi-root data/transition_pointcloud_roi_world \
   --results-root /Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/results \
-  --sdf-root /Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/jobs \
+  --jobs-root /Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/jobs \
   --job-name job_003 \
   --ik-near-root data/tcp_ik_near \
   --ik-far-root data/tcp_ik_far \
   --noisy-root data/noisy_transition_joint_trajectories \
   --local-points config/robot-model/ur5e_surface_points_local.npz \
   --output data/pointcloud_joint_dataset/job_003.npz \
+  --radius-m 0.1 \
+  --height-m 0.1 \
+  --num-mesh-sample-points 100000 \
   --num-points 512 \
   --point-scale 0.1 \
   --outside-mode project \
   --seed 0
 ```
 
-By default, the output NPZ only stores the four training fields listed above. Add `--save-metadata` only when source paths, raw joint values, or TCP transforms are needed for debugging. SDF distance query results are computed in memory and are not saved as intermediate files.
+The workpiece STL is transformed and sampled only once per job, then reused by all matching transitions. By default, the output NPZ only stores the four training fields listed above. Add `--save-metadata` only when source paths, raw joint values, or TCP transforms are needed for debugging. ROI point clouds and SDF distance query results are computed in memory and are not saved as intermediate files.
 
 ### Train the Fusion Model
 
