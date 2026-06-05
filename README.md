@@ -33,6 +33,67 @@ The latest codes are tested on Ubuntu 16.04, CUDA10.1, PyTorch 1.6 and Python 3.
 conda install pytorch==1.6.0 cudatoolkit=10.1 -c pytorch
 ```
 
+## Robot Collision-Distance Dataset and Training
+
+This project also contains a PointNet-based model for predicting robot-workpiece collision and minimum signed distance.
+
+Each final dataset sample contains:
+
+- `point_clouds`: TCP-frame point cloud with shape `[512, 3]`
+- `joint_features`: normalized joint feature with shape `[18]`
+- `collision_labels`: `0` for collision-free and `1` for collision
+- `min_distance_norm`: signed SDF distance clipped to `[-0.05, 0.05]` and divided by `0.05`
+
+### Build the Dataset
+
+The command below builds one final dataset for `job_003`. The ROI, near-field IK, far-field IK, and noisy expert trajectory roots must contain files with matching `transition_xxxx_xxxx` names.
+
+```shell
+python data_utils/build_pointcloud_joint_input_dataset.py \
+  --roi-root data/transition_pointcloud_roi_world \
+  --results-root /Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/results \
+  --sdf-root /Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/jobs \
+  --job-name job_003 \
+  --ik-near-root data/tcp_ik_near \
+  --ik-far-root data/tcp_ik_far \
+  --noisy-root data/noisy_transition_joint_trajectories \
+  --local-points config/robot-model/ur5e_surface_points_local.npz \
+  --output data/pointcloud_joint_dataset/job_003.npz \
+  --num-points 512 \
+  --point-scale 0.1 \
+  --outside-mode project \
+  --seed 0
+```
+
+By default, the output NPZ only stores the four training fields listed above. Add `--save-metadata` only when source paths, raw joint values, or TCP transforms are needed for debugging. SDF distance query results are computed in memory and are not saved as intermediate files.
+
+### Train the Fusion Model
+
+The training command uses a fixed random train/validation split, `BCEWithLogitsLoss` for collision prediction, and `SmoothL1Loss` for normalized distance regression.
+
+```shell
+python train_joint_collision_distance.py \
+  --dataset data/pointcloud_joint_dataset/job_003.npz \
+  --output-dir log/joint_collision_distance/job_003 \
+  --epochs 100 \
+  --batch-size 64 \
+  --learning-rate 0.001 \
+  --weight-decay 0.0001 \
+  --val-ratio 0.1 \
+  --collision-weight 1.0 \
+  --distance-weight 1.0 \
+  --device auto \
+  --seed 0
+```
+
+The best validation checkpoint is saved to:
+
+```text
+log/joint_collision_distance/job_003/best_model.pth
+```
+
+The fusion model is defined in `models/pointnet_joint_collision_distance.py`. It accepts point clouds in either `[B, 512, 3]` or `[B, 3, 512]` format and returns `unsafe_logit`, `d_min_norm`, `z_pc`, `z_q`, and `z_fusion`.
+
 ## Classification (ModelNet10/40)
 ### Data Preparation
 Download alignment **ModelNet** [here](https://shapenet.cs.stanford.edu/media/modelnet40_normal_resampled.zip) and save in `data/modelnet40_normal_resampled/`.

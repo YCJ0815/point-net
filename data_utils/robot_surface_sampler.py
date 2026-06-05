@@ -197,6 +197,41 @@ class URDFSurfaceSampler:
         merged = trimesh.util.concatenate(meshes)
         return merged, np.array(face_link_names, dtype=object)
 
+    def build_link_meshes(self, joint_values=None, include_links=None):
+        joint_values = joint_values or {}
+        include_links = set(include_links) if include_links else None
+        cache = {}
+        link_meshes = {}
+
+        for link_name, collisions in self.links.items():
+            if include_links is not None and link_name not in include_links:
+                continue
+            transformed = []
+            link_tf = self.link_transform(link_name, joint_values, cache)
+            for collision in collisions:
+                mesh = self._primitive_mesh(collision)
+                mesh.apply_transform(link_tf @ collision.origin)
+                transformed.append(mesh)
+            if transformed:
+                link_meshes[link_name] = trimesh.util.concatenate(transformed)
+        return link_meshes
+
+    def build_link_local_meshes(self, include_links=None):
+        include_links = set(include_links) if include_links else None
+        link_meshes = {}
+
+        for link_name, collisions in self.links.items():
+            if include_links is not None and link_name not in include_links:
+                continue
+            transformed = []
+            for collision in collisions:
+                mesh = self._primitive_mesh(collision)
+                mesh.apply_transform(collision.origin)
+                transformed.append(mesh)
+            if transformed:
+                link_meshes[link_name] = trimesh.util.concatenate(transformed)
+        return link_meshes
+
 
 def farthest_point_sample_numpy(points, sample_count, seed=0):
     if sample_count >= len(points):
@@ -268,6 +303,106 @@ def sample_surface_points(mesh, face_link_names, count=None, spacing=None, seed=
     }
 
 
+def allocate_counts_by_area(link_meshes, total_count, min_points_per_link):
+    link_names = list(link_meshes.keys())
+    if not link_names:
+        raise ValueError("No link meshes available for allocation.")
+
+    total_count = int(total_count)
+    min_points_per_link = max(0, int(min_points_per_link))
+    link_num = len(link_names)
+    if total_count < link_num:
+        raise ValueError(f"num-points={total_count} is smaller than number of sampled links={link_num}.")
+    if min_points_per_link * link_num > total_count:
+        raise ValueError(
+            f"min_points_per_link={min_points_per_link} is too large for total_count={total_count} and {link_num} links."
+        )
+
+    areas = np.array([max(float(link_meshes[name].area), 1e-12) for name in link_names], dtype=np.float64)
+    area_ratio = areas / areas.sum()
+    counts = np.full(link_num, min_points_per_link, dtype=np.int64)
+    remaining = total_count - counts.sum()
+
+    if remaining > 0:
+        extra_float = area_ratio * remaining
+        extra_floor = np.floor(extra_float).astype(np.int64)
+        counts += extra_floor
+        leftover = remaining - int(extra_floor.sum())
+        if leftover > 0:
+            order = np.argsort(-(extra_float - extra_floor))
+            for idx in order[:leftover]:
+                counts[idx] += 1
+
+    return {name: int(count) for name, count in zip(link_names, counts)}
+
+
+def sample_surface_points_per_link(link_meshes, count, min_points_per_link=32, seed=0):
+    allocations = allocate_counts_by_area(link_meshes, count, min_points_per_link)
+    all_points = []
+    all_normals = []
+    all_link_names = []
+    per_link_counts = {}
+
+    for idx, (link_name, link_mesh) in enumerate(link_meshes.items()):
+        link_count = allocations[link_name]
+        link_seed = seed + idx
+        candidate_count = max(link_count * 20, link_count + 1024)
+        candidate_points, candidate_faces = trimesh.sample.sample_surface(link_mesh, count=candidate_count, seed=link_seed)
+        keep = farthest_point_sample_numpy(candidate_points, link_count, seed=link_seed)
+        points = candidate_points[keep].astype(np.float32)
+        normals = link_mesh.face_normals[candidate_faces[keep]].astype(np.float32)
+
+        all_points.append(points)
+        all_normals.append(normals)
+        all_link_names.extend([link_name] * len(points))
+        per_link_counts[link_name] = int(len(points))
+
+    points = np.concatenate(all_points, axis=0)
+    normals = np.concatenate(all_normals, axis=0)
+    return {
+        "points": points,
+        "normals": normals,
+        "face_index": np.full(len(points), -1, dtype=np.int64),
+        "link_name": np.array(all_link_names, dtype=object),
+        "target_count": int(count),
+        "actual_count": int(len(points)),
+        "surface_area": float(sum(mesh.area for mesh in link_meshes.values())),
+        "per_link_counts": per_link_counts,
+    }
+
+
+def transform_points_with_matrix(points, normals, matrix):
+    rot = matrix[:3, :3]
+    trans = matrix[:3, 3]
+    world_points = points @ rot.T + trans
+    world_normals = normals @ rot.T
+    norm = np.linalg.norm(world_normals, axis=1, keepdims=True)
+    world_normals = world_normals / np.clip(norm, 1e-12, None)
+    return world_points.astype(np.float32), world_normals.astype(np.float32)
+
+
+def convert_link_local_sample_to_world(sample_dict, sampler, joint_values):
+    link_names = np.asarray(sample_dict["link_name"], dtype=object)
+    local_points = np.asarray(sample_dict["points"], dtype=np.float32)
+    local_normals = np.asarray(sample_dict["normals"], dtype=np.float32)
+    world_points = np.empty_like(local_points)
+    world_normals = np.empty_like(local_normals)
+    cache = {}
+
+    for link_name in np.unique(link_names):
+        mask = link_names == link_name
+        matrix = sampler.link_transform(str(link_name), joint_values, cache)
+        pts, nrm = transform_points_with_matrix(local_points[mask], local_normals[mask], matrix)
+        world_points[mask] = pts
+        world_normals[mask] = nrm
+
+    converted = dict(sample_dict)
+    converted["points"] = world_points
+    converted["normals"] = world_normals
+    converted["frame"] = "world"
+    return converted
+
+
 def parse_joint_values(text, robot):
     if text is None:
         return {}
@@ -306,7 +441,22 @@ def save_npz(output_path, sample_dict):
         target_count=np.array(sample_dict["target_count"], dtype=np.int64),
         actual_count=np.array(sample_dict["actual_count"], dtype=np.int64),
         surface_area=np.array(sample_dict["surface_area"], dtype=np.float64),
+        frame=np.array(sample_dict.get("frame", "world")),
     )
+
+
+def load_sample_dict(path):
+    data = np.load(Path(path).resolve(), allow_pickle=True)
+    return {
+        "points": np.asarray(data["points"], dtype=np.float32),
+        "normals": np.asarray(data["normals"], dtype=np.float32),
+        "face_index": np.asarray(data["face_index"], dtype=np.int64),
+        "link_name": np.asarray(data["link_name"], dtype=object),
+        "target_count": int(np.asarray(data["target_count"]).item()),
+        "actual_count": int(np.asarray(data["actual_count"]).item()),
+        "surface_area": float(np.asarray(data["surface_area"]).item()),
+        "frame": str(np.asarray(data["frame"]).item()) if "frame" in data else "world",
+    }
 
 
 def save_ply(output_path, sample_dict):
@@ -315,6 +465,66 @@ def save_ply(output_path, sample_dict):
         metadata={"vertex_normals": sample_dict["normals"]},
     )
     cloud.export(output_path)
+
+
+def ensure_local_surface_points(
+    sampler,
+    local_points_path,
+    num_points,
+    min_points_per_link,
+    include_links=None,
+    seed=0,
+    force_resample=False,
+):
+    local_points_path = Path(local_points_path).resolve()
+    if local_points_path.exists() and not force_resample:
+        sample_dict = load_sample_dict(local_points_path)
+        if sample_dict["frame"] != "link_local":
+            raise ValueError(
+                f"Existing local points file {local_points_path} has frame={sample_dict['frame']}, expected link_local."
+            )
+        return sample_dict
+
+    link_meshes = sampler.build_link_local_meshes(include_links=include_links)
+    sample_dict = sample_surface_points_per_link(
+        link_meshes,
+        count=num_points,
+        min_points_per_link=min_points_per_link,
+        seed=seed,
+    )
+    sample_dict["frame"] = "link_local"
+    local_points_path.parent.mkdir(parents=True, exist_ok=True)
+    save_npz(local_points_path, sample_dict)
+    return sample_dict
+
+
+def generate_current_robot_surface_points(
+    urdf_path,
+    joint_values_text,
+    output_path,
+    local_points_path,
+    num_points=8192,
+    min_points_per_link=32,
+    include_links=None,
+    seed=0,
+    force_resample=False,
+):
+    sampler = URDFSurfaceSampler(urdf_path)
+    joint_values = parse_joint_values(joint_values_text, sampler)
+    local_sample = ensure_local_surface_points(
+        sampler=sampler,
+        local_points_path=local_points_path,
+        num_points=num_points,
+        min_points_per_link=min_points_per_link,
+        include_links=include_links,
+        seed=seed,
+        force_resample=force_resample,
+    )
+    world_sample = convert_link_local_sample_to_world(local_sample, sampler, joint_values)
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_npz(output_path, world_sample)
+    return world_sample
 
 
 def main():
@@ -346,6 +556,19 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument(
+        "--output-frame",
+        type=str,
+        default="link_local",
+        choices=["link_local", "world"],
+        help="Save points in per-link local coordinates or current world coordinates",
+    )
+    parser.add_argument(
+        "--min-points-per-link",
+        type=int,
+        default=32,
+        help="Minimum sampled points for each link when using fixed-count sampling",
+    )
+    parser.add_argument(
         "--include-links",
         type=str,
         default=None,
@@ -356,18 +579,38 @@ def main():
     sampler = URDFSurfaceSampler(args.urdf)
     joint_values = parse_joint_values(args.joint_values, sampler)
     include_links = args.include_links.split(",") if args.include_links else None
-    robot_mesh, face_link_names = sampler.build_robot_mesh(
-        joint_values=joint_values,
-        include_links=include_links,
-    )
 
-    sample_dict = sample_surface_points(
-        robot_mesh,
-        face_link_names,
-        count=args.num_points if args.spacing is None else None,
-        spacing=args.spacing,
-        seed=args.seed,
-    )
+    if args.output_frame == "link_local" and args.spacing is not None:
+        raise ValueError("link_local output currently supports fixed-count sampling only; omit --spacing.")
+
+    if args.spacing is None:
+        if args.output_frame == "link_local":
+            link_meshes = sampler.build_link_local_meshes(include_links=include_links)
+        else:
+            link_meshes = sampler.build_link_meshes(
+                joint_values=joint_values,
+                include_links=include_links,
+            )
+        sample_dict = sample_surface_points_per_link(
+            link_meshes,
+            count=args.num_points,
+            min_points_per_link=args.min_points_per_link,
+            seed=args.seed,
+        )
+        sample_dict["frame"] = args.output_frame
+    else:
+        robot_mesh, face_link_names = sampler.build_robot_mesh(
+            joint_values=joint_values,
+            include_links=include_links,
+        )
+        sample_dict = sample_surface_points(
+            robot_mesh,
+            face_link_names,
+            count=None,
+            spacing=args.spacing,
+            seed=args.seed,
+        )
+        sample_dict["frame"] = "world"
 
     output_path = Path(args.output).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -384,6 +627,7 @@ def main():
     print(f"Surface area: {sample_dict['surface_area']:.6f}")
     print(f"Target count: {sample_dict['target_count']}")
     print(f"Actual count: {sample_dict['actual_count']}")
+    print(f"Frame: {sample_dict.get('frame', 'world')}")
     print("Per-link counts:")
     for link_name, link_count in zip(unique_links, counts):
         print(f"  {link_name}: {int(link_count)}")
