@@ -1,5 +1,4 @@
 import argparse
-import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -14,6 +13,15 @@ try:
         load_transformed_mesh_world,
         sample_mesh_surface,
     )
+    from .extract_noisy_transition_joint_trajectories import build_noisy_trajectory
+    from .sample_tcp_points_from_workpiece import (
+        estimate_point_normals,
+        generate_tcp_orientations,
+        generate_tcp_points_from_point_cloud,
+        generate_tcp_points_from_roi_capsule,
+        load_sdf_metadata,
+    )
+    from .solve_tcp_ik_from_samples import PyBulletIKSolver
 except ImportError:
     from numpy_npz_compat import install_numpy_pickle_compat
     from query_current_robot_workpiece_distance import RobotWorkpieceDistanceQuery
@@ -23,6 +31,15 @@ except ImportError:
         load_transformed_mesh_world,
         sample_mesh_surface,
     )
+    from extract_noisy_transition_joint_trajectories import build_noisy_trajectory
+    from sample_tcp_points_from_workpiece import (
+        estimate_point_normals,
+        generate_tcp_orientations,
+        generate_tcp_points_from_point_cloud,
+        generate_tcp_points_from_roi_capsule,
+        load_sdf_metadata,
+    )
+    from solve_tcp_ik_from_samples import PyBulletIKSolver
 
 install_numpy_pickle_compat()
 
@@ -39,25 +56,6 @@ DEFAULT_JOINT_NAMES = (
     "wrist_2_joint",
     "wrist_3_joint",
 )
-TRANSITION_RE = re.compile(r"(transition_\d+_\d+)")
-
-
-def scalar_string(value):
-    arr = np.asarray(value)
-    if arr.shape == ():
-        return str(arr.item())
-    if arr.size == 1:
-        return str(arr.reshape(-1)[0])
-    raise ValueError(f"Expected scalar string-compatible value, got shape {arr.shape}")
-
-
-def infer_transition_stem(path):
-    match = TRANSITION_RE.search(Path(path).stem)
-    if match is None:
-        raise ValueError(f"Cannot infer transition stem from path: {path}")
-    return match.group(1)
-
-
 def find_job_dir(root, job_name):
     root = Path(root).resolve()
     if job_name is None:
@@ -197,68 +195,8 @@ def load_transition_npz(transition_path):
             "q_start": np.asarray(data["q_start"], dtype=np.float32).reshape(6),
             "start_xyz": np.asarray(data["start_xyz"], dtype=np.float32).reshape(3),
             "end_xyz": np.asarray(data["end_xyz"], dtype=np.float32).reshape(3),
+            "q_playback": np.asarray(data["q_playback"], dtype=np.float32) if "q_playback" in data else None,
         }
-
-
-def candidate_dir_for_root(root, job_name):
-    root = Path(root).resolve()
-    if job_name is None:
-        return root
-    nested = root / job_name
-    if nested.is_dir():
-        return nested
-    return root
-
-
-def source_file_matches_kind(path, data, source_kind):
-    if source_kind not in ("ik_near", "ik_far"):
-        return True
-
-    markers = [Path(path).stem.lower()]
-    if "source_tcp_npz" in data:
-        markers.append(scalar_string(data["source_tcp_npz"]).lower())
-    joined = " ".join(markers)
-    looks_far = "far" in joined
-    return looks_far if source_kind == "ik_far" else not looks_far
-
-
-def find_source_files(source_root, job_name, transition_stem, required_key, source_kind):
-    if source_root is None:
-        return []
-    source_dir = candidate_dir_for_root(source_root, job_name)
-    if not source_dir.is_dir():
-        return []
-
-    matches = []
-    for path in sorted(source_dir.glob(f"{transition_stem}*.npz")):
-        try:
-            with np.load(path, allow_pickle=True) as data:
-                if required_key in data and source_file_matches_kind(path, data, source_kind):
-                    matches.append(path.resolve())
-        except Exception:
-            continue
-    return matches
-
-
-def load_joint_samples_from_source(source_path, source_kind):
-    with np.load(source_path, allow_pickle=True) as data:
-        if source_kind in ("ik_near", "ik_far"):
-            key = "ik_solutions"
-            if "joint_names" not in data:
-                raise KeyError(f"IK source {source_path} missing required key 'joint_names'")
-            joint_names = [str(name) for name in data["joint_names"].tolist()]
-        elif source_kind == "noisy_playback":
-            key = "q_playback_noisy"
-            joint_names = list(DEFAULT_JOINT_NAMES)
-        else:
-            raise ValueError(f"Unsupported source kind: {source_kind}")
-
-        if key not in data:
-            raise KeyError(f"Joint source {source_path} missing required key '{key}'")
-        q_samples = np.asarray(data[key], dtype=np.float32)
-    if q_samples.ndim != 2 or q_samples.shape[1] != 6:
-        raise ValueError(f"{key} must have shape [N, 6], got {q_samples.shape} in {source_path}")
-    return q_samples, joint_names
 
 
 def resolve_job_assets(jobs_root, transition_path):
@@ -295,33 +233,15 @@ def process_one_transition(
     job_surface_points,
     stl_path,
     sdf_path,
+    sdf_meta,
     args,
     joint_limits_lower,
     joint_limits_upper,
     distance_query,
+    ik_solver,
+    transition_seed,
 ):
     transition = load_transition_npz(transition_path)
-    transition_stem = infer_transition_stem(transition_path)
-    job_name = Path(transition_path).resolve().parent.name
-    source_specs = [
-        ("ik_near", args.ik_near_root, "ik_solutions"),
-        ("ik_far", args.ik_far_root, "ik_solutions"),
-        ("noisy_playback", args.noisy_root, "q_playback_noisy"),
-    ]
-    matched_sources = []
-    for source_kind, source_root, required_key in source_specs:
-        for source_path in find_source_files(source_root, job_name, transition_stem, required_key, source_kind):
-            matched_sources.append((source_kind, source_path))
-
-    if not matched_sources:
-        return {
-            "transition_path": str(transition_path),
-            "stl_path": str(stl_path),
-            "blocks": [],
-            "failures": [],
-            "skipped_invalid_distance": 0,
-        }
-
     cropped_points_world = crop_xy_radius_height_point_cloud(
         points=job_surface_points,
         start=transition["start_xyz"],
@@ -332,22 +252,113 @@ def process_one_transition(
     points_world_512 = farthest_point_sampling_numpy(
         cropped_points_world,
         num_points=args.num_points,
-        seed=args.seed,
+        seed=transition_seed,
     )
     canonical_start_tf = canonicalize_axis_symmetric_tcp_transform(transition["start_tf"])
     points_tcp = world_to_tcp_points(points_world_512, canonical_start_tf)
     point_cloud_input = (points_tcp / float(args.point_scale)).astype(np.float32)
 
-    blocks = []
     failures = []
-    skipped_invalid_distance = 0
-    for source_kind, source_path in matched_sources:
+    generated_sources = []
+    normals = None
+
+    if not args.skip_near_ik or not args.skip_far_ik:
+        normals = estimate_point_normals(points_world_512.astype(np.float64), args.normal_k)
+
+    def solve_tcp_source(source_kind, tcp_samples, seed_offset):
+        orientations = generate_tcp_orientations(
+            num_points=len(tcp_samples["tcp_points"]),
+            seed=transition_seed + seed_offset,
+        )
+        ik_result = ik_solver.solve(
+            tcp_points=tcp_samples["tcp_points"],
+            orientation_quaternions_xyzw=orientations["orientation_quaternions_xyzw"],
+            max_orientations=args.ik_max_orientations,
+            max_solutions=args.ik_max_solutions,
+            num_random_seeds=args.ik_num_random_seeds,
+            max_random_retries=args.ik_max_random_retries,
+            seed=transition_seed + seed_offset + 1,
+            joint_tol=args.ik_joint_tol,
+            pos_tol=args.ik_pos_tol,
+            orn_tol_deg=args.ik_orn_tol_deg,
+            max_iterations=args.ik_max_iterations,
+            residual_threshold=args.ik_residual_threshold,
+            progress_every=args.ik_progress_every,
+        )
+        generated_sources.append(
+            (
+                source_kind,
+                np.asarray(ik_result["ik_solutions"], dtype=np.float32),
+                np.arange(len(ik_result["ik_solutions"]), dtype=np.int32),
+            )
+        )
+
+    if not args.skip_near_ik:
         try:
-            q_samples, source_joint_names = load_joint_samples_from_source(source_path, source_kind)
+            near_samples = generate_tcp_points_from_point_cloud(
+                points=points_world_512.astype(np.float64),
+                normals=normals,
+                sdf_meta=sdf_meta,
+                num_points=args.near_tcp_points,
+                near_range=(args.near_min, args.near_max),
+                probe_eps=args.probe_eps,
+                seed=transition_seed + 101,
+            )
+            solve_tcp_source("ik_near", near_samples, 201)
+        except Exception as exc:
+            failures.append((f"{transition_path}:ik_near", str(exc)))
+
+    if not args.skip_far_ik:
+        try:
+            roi_meta = {
+                "start_xyz_world_m": transition["start_xyz"],
+                "goal_xyz_world_m": transition["end_xyz"],
+                "radius_m": args.radius_m,
+                "height_m": args.height_m,
+                "z_min": float(np.min(job_surface_points[:, 2])),
+            }
+            far_samples = generate_tcp_points_from_roi_capsule(
+                points=points_world_512.astype(np.float64),
+                normals=normals,
+                sdf_meta=sdf_meta,
+                roi_meta=roi_meta,
+                num_points=args.far_tcp_points,
+                far_min=args.far_min,
+                probe_eps=args.probe_eps,
+                seed=transition_seed + 301,
+            )
+            solve_tcp_source("ik_far", far_samples, 401)
+        except Exception as exc:
+            failures.append((f"{transition_path}:ik_far", str(exc)))
+
+    if not args.skip_noisy_playback:
+        try:
+            q_playback = np.asarray(transition["q_playback"], dtype=np.float32)
+            if q_playback.ndim != 2 or q_playback.shape[1] != 6:
+                raise ValueError(f"q_playback must have shape [T, 6], got {q_playback.shape}")
+            q_noisy, _ = build_noisy_trajectory(
+                trajectory=q_playback,
+                sigma=args.noise_sigma,
+                clip_min=-args.noise_clip,
+                clip_max=args.noise_clip,
+                rng=np.random.default_rng(transition_seed + 501),
+            )
+            generated_sources.append(
+                ("noisy_playback", q_noisy, np.arange(len(q_noisy), dtype=np.int32))
+            )
+        except Exception as exc:
+            failures.append((f"{transition_path}:noisy_playback", str(exc)))
+
+    blocks = []
+    skipped_invalid_distance = 0
+    for source_kind, q_samples, source_indices in generated_sources:
+        if len(q_samples) == 0:
+            continue
+        try:
             distance_result = distance_query.query_joint_values(
                 joint_values=q_samples,
                 sdf_path=sdf_path,
-                joint_names=source_joint_names,
+                joint_names=DEFAULT_JOINT_NAMES,
                 outside_mode=args.outside_mode,
                 progress_every=args.distance_progress_every,
             )
@@ -357,7 +368,7 @@ def process_one_transition(
             if not np.any(valid_mask):
                 continue
 
-            source_indices = np.flatnonzero(valid_mask).astype(np.int32)
+            source_indices = source_indices[valid_mask]
             q_samples = q_samples[valid_mask]
             min_signed_distance = min_signed_distance[valid_mask]
             joint_features, q_start_tiled, delta_q = build_joint_features(
@@ -369,6 +380,7 @@ def process_one_transition(
             collision_labels, min_distance_norm = build_distance_targets(min_signed_distance)
             count = q_samples.shape[0]
             block = {
+                "source_kind": source_kind,
                 "joint_features": joint_features.astype(np.float32),
                 "point_clouds": np.repeat(point_cloud_input[None, :, :], count, axis=0).astype(np.float32),
                 "collision_labels": collision_labels,
@@ -377,8 +389,7 @@ def process_one_transition(
             if args.save_metadata:
                 block.update(
                     {
-                        "source_kind": source_kind,
-                        "source_path": str(source_path),
+                        "source_path": f"in_memory:{source_kind}",
                         "q_sample": q_samples.astype(np.float32),
                         "q_start": q_start_tiled.astype(np.float32),
                         "delta_q": delta_q.astype(np.float32),
@@ -388,7 +399,7 @@ def process_one_transition(
                 )
             blocks.append(block)
         except Exception as exc:
-            failures.append((str(source_path), str(exc)))
+            failures.append((f"{transition_path}:{source_kind}:distance", str(exc)))
 
     return {
         "transition_path": str(transition_path),
@@ -408,6 +419,8 @@ def concatenate_or_empty(arrays, shape, dtype):
 def build_dataset(args):
     joint_limits_lower, joint_limits_upper = parse_urdf_joint_limits(args.urdf)
     transition_files = collect_transition_files(args.results_root, args.job_name, args.transition_name)
+    if args.max_transitions is not None:
+        transition_files = transition_files[: args.max_transitions]
     distance_query = RobotWorkpieceDistanceQuery(
         urdf_path=args.urdf,
         local_points_path=args.local_points,
@@ -433,51 +446,65 @@ def build_dataset(args):
         joint_index_in_source = []
     failures = []
     skipped_invalid_distance = 0
+    source_sample_counts = {"ik_near": 0, "ik_far": 0, "noisy_playback": 0}
     job_surface_cache = {}
+    sdf_meta_cache = {}
+    ik_solver = None
+    if not args.skip_near_ik or not args.skip_far_ik:
+        ik_solver = PyBulletIKSolver(args.urdf, tcp_link=args.tcp_link)
 
     processed_transitions = 0
-    for transition_index_value, transition_path in enumerate(transition_files):
-        try:
-            job_dir, stl_path, sdf_path = resolve_job_assets(args.jobs_root, transition_path)
-            if job_dir not in job_surface_cache:
-                job_surface_cache[job_dir] = load_job_surface_points(job_dir, stl_path, args)
-                print(
-                    f"sampled_workpiece_surface: {job_dir.name} | "
-                    f"points: {len(job_surface_cache[job_dir])}"
-                )
+    try:
+        for transition_index_value, transition_path in enumerate(transition_files):
+            try:
+                job_dir, stl_path, sdf_path = resolve_job_assets(args.jobs_root, transition_path)
+                if job_dir not in job_surface_cache:
+                    job_surface_cache[job_dir] = load_job_surface_points(job_dir, stl_path, args)
+                    sdf_meta_cache[job_dir] = load_sdf_metadata(sdf_path)
+                    print(
+                        f"sampled_workpiece_surface: {job_dir.name} | "
+                        f"points: {len(job_surface_cache[job_dir])}"
+                    )
 
-            result = process_one_transition(
-                transition_path=transition_path,
-                job_surface_points=job_surface_cache[job_dir],
-                stl_path=stl_path,
-                sdf_path=sdf_path,
-                args=args,
-                joint_limits_lower=joint_limits_lower,
-                joint_limits_upper=joint_limits_upper,
-                distance_query=distance_query,
-            )
-            processed_transitions += 1
-            failures.extend(result["failures"])
-            skipped_invalid_distance += result["skipped_invalid_distance"]
-            for block in result["blocks"]:
-                count = block["joint_features"].shape[0]
-                point_clouds.append(block["point_clouds"])
-                joint_features.append(block["joint_features"])
-                collision_labels.append(block["collision_labels"])
-                min_distance_norm.append(block["min_distance_norm"])
-                if args.save_metadata:
-                    q_start.append(block["q_start"])
-                    q_sample.append(block["q_sample"])
-                    delta_q.append(block["delta_q"])
-                    canonical_start_tf.append(block["canonical_start_tf"])
-                    joint_source.extend([block["source_kind"]] * count)
-                    source_transition_npz.extend([result["transition_path"]] * count)
-                    source_joint_npz.extend([block["source_path"]] * count)
-                    source_workpiece_stl.extend([result["stl_path"]] * count)
-                    transition_index.extend([transition_index_value] * count)
-                    joint_index_in_source.extend(block["source_indices"].tolist())
-        except Exception as exc:
-            failures.append((str(transition_path), str(exc)))
+                result = process_one_transition(
+                    transition_path=transition_path,
+                    job_surface_points=job_surface_cache[job_dir],
+                    stl_path=stl_path,
+                    sdf_path=sdf_path,
+                    sdf_meta=sdf_meta_cache[job_dir],
+                    args=args,
+                    joint_limits_lower=joint_limits_lower,
+                    joint_limits_upper=joint_limits_upper,
+                    distance_query=distance_query,
+                    ik_solver=ik_solver,
+                    transition_seed=args.seed + transition_index_value * 1009,
+                )
+                processed_transitions += 1
+                failures.extend(result["failures"])
+                skipped_invalid_distance += result["skipped_invalid_distance"]
+                for block in result["blocks"]:
+                    count = block["joint_features"].shape[0]
+                    source_sample_counts[block["source_kind"]] += count
+                    point_clouds.append(block["point_clouds"])
+                    joint_features.append(block["joint_features"])
+                    collision_labels.append(block["collision_labels"])
+                    min_distance_norm.append(block["min_distance_norm"])
+                    if args.save_metadata:
+                        q_start.append(block["q_start"])
+                        q_sample.append(block["q_sample"])
+                        delta_q.append(block["delta_q"])
+                        canonical_start_tf.append(block["canonical_start_tf"])
+                        joint_source.extend([block["source_kind"]] * count)
+                        source_transition_npz.extend([result["transition_path"]] * count)
+                        source_joint_npz.extend([block["source_path"]] * count)
+                        source_workpiece_stl.extend([result["stl_path"]] * count)
+                        transition_index.extend([transition_index_value] * count)
+                        joint_index_in_source.extend(block["source_indices"].tolist())
+            except Exception as exc:
+                failures.append((str(transition_path), str(exc)))
+    finally:
+        if ik_solver is not None:
+            ik_solver.close()
 
     dataset = {
         "point_clouds": concatenate_or_empty(point_clouds, (0, args.num_points, 3), np.float32),
@@ -515,6 +542,7 @@ def build_dataset(args):
     print(f"transition_files_processed: {processed_transitions}")
     print(f"workpiece_surfaces_sampled: {len(job_surface_cache)}")
     print(f"samples: {dataset['point_clouds'].shape[0]}")
+    print(f"source_samples: {source_sample_counts}")
     print(f"point_clouds: {dataset['point_clouds'].shape}")
     print(f"joint_features: {dataset['joint_features'].shape}")
     print(f"collision_labels: {dataset['collision_labels'].shape}")
@@ -534,9 +562,7 @@ def main():
     parser.add_argument("--jobs-root", type=str, default=DEFAULT_JOBS_ROOT, help="Root containing job_xxx/workpiece.stl and workpiece_sdf.npz")
     parser.add_argument("--job-name", type=str, default=None, help="Optional job name, e.g. job_003")
     parser.add_argument("--transition-name", type=str, default=None, help="Optional transition stem, e.g. transition_0012_0053")
-    parser.add_argument("--ik-near-root", type=str, default=None, help="Root containing near-surface IK npz files")
-    parser.add_argument("--ik-far-root", type=str, default=None, help="Root containing far-field IK npz files")
-    parser.add_argument("--noisy-root", type=str, default=None, help="Root containing q_playback_noisy npz files")
+    parser.add_argument("--max-transitions", type=int, default=None, help="Only process the first N transitions for debugging")
     parser.add_argument("--output", type=str, required=True, help="Output dataset npz path")
     parser.add_argument("--urdf", type=str, default=DEFAULT_URDF, help="Robot URDF path used for joint limits")
     parser.add_argument("--local-points", type=str, default=DEFAULT_LOCAL_POINTS, help="Link-local robot surface point cache; sampled in memory if missing")
@@ -546,6 +572,29 @@ def main():
     parser.add_argument("--use-even-sampling", action="store_true", help="Use trimesh even surface sampling for the workpiece")
     parser.add_argument("--num-points", type=int, default=512, help="Point count per sample after downsampling/padding")
     parser.add_argument("--point-scale", type=float, default=0.1, help="TCP-frame point cloud normalization divisor in meters")
+    parser.add_argument("--near-tcp-points", type=int, default=40, help="Near-surface TCP points generated per transition")
+    parser.add_argument("--far-tcp-points", type=int, default=20, help="ROI far-field TCP points generated per transition")
+    parser.add_argument("--near-min", type=float, default=0.0, help="Minimum near-surface TCP offset in meters")
+    parser.add_argument("--near-max", type=float, default=0.02, help="Maximum near-surface TCP offset in meters")
+    parser.add_argument("--far-min", type=float, default=0.02, help="Minimum far-field TCP offset in meters")
+    parser.add_argument("--normal-k", type=int, default=30, help="Neighbors used to estimate ROI point normals")
+    parser.add_argument("--probe-eps", type=float, default=0.003, help="SDF probe distance used to orient surface normals")
+    parser.add_argument("--tcp-link", type=str, default="tool0", help="URDF link whose pose is constrained by IK")
+    parser.add_argument("--ik-max-orientations", type=int, default=None, help="Only solve the first M of the 12 orientations for debugging")
+    parser.add_argument("--ik-max-solutions", type=int, default=8, help="Maximum unique IK solutions per TCP pose")
+    parser.add_argument("--ik-num-random-seeds", type=int, default=6, help="Random seeds added to the deterministic IK seed bank")
+    parser.add_argument("--ik-max-random-retries", type=int, default=6, help="Extra random retries after the IK seed bank")
+    parser.add_argument("--ik-joint-tol", type=float, default=0.15, help="Joint-space tolerance used to merge duplicate IK solutions")
+    parser.add_argument("--ik-pos-tol", type=float, default=0.005, help="Maximum accepted IK TCP position error in meters")
+    parser.add_argument("--ik-orn-tol-deg", type=float, default=5.0, help="Maximum accepted IK orientation error in degrees")
+    parser.add_argument("--ik-max-iterations", type=int, default=240, help="PyBullet iterations per IK solve")
+    parser.add_argument("--ik-residual-threshold", type=float, default=1e-5, help="PyBullet IK residual threshold")
+    parser.add_argument("--ik-progress-every", type=int, default=0, help="Print progress every N TCP poses inside each IK source")
+    parser.add_argument("--noise-sigma", type=float, default=0.05 / 3.0, help="Gaussian sigma for q_playback perturbation")
+    parser.add_argument("--noise-clip", type=float, default=0.05, help="Absolute clipping bound for Gaussian joint noise")
+    parser.add_argument("--skip-near-ik", action="store_true", help="Do not generate near-surface TCP/IK samples")
+    parser.add_argument("--skip-far-ik", action="store_true", help="Do not generate far-field TCP/IK samples")
+    parser.add_argument("--skip-noisy-playback", action="store_true", help="Do not generate noisy q_playback samples")
     parser.add_argument("--distance-num-points", type=int, default=8192, help="Robot surface point count if local cache must be sampled in memory")
     parser.add_argument("--distance-min-points-per-link", type=int, default=32, help="Minimum robot surface points per link when sampling in memory")
     parser.add_argument("--outside-mode", type=str, default="project", choices=["ignore", "project", "error"], help="How robot points outside the SDF grid are handled")
@@ -556,6 +605,8 @@ def main():
 
     if args.num_points <= 0:
         raise ValueError("--num-points must be positive.")
+    if args.max_transitions is not None and args.max_transitions <= 0:
+        raise ValueError("--max-transitions must be positive.")
     if args.radius_m <= 0:
         raise ValueError("--radius-m must be positive.")
     if args.height_m <= 0:
@@ -570,8 +621,22 @@ def main():
         raise ValueError("--distance-min-points-per-link must be non-negative.")
     if args.distance_progress_every < 0:
         raise ValueError("--distance-progress-every must be non-negative.")
-    if args.ik_near_root is None and args.ik_far_root is None and args.noisy_root is None:
-        raise ValueError("Provide at least one of --ik-near-root, --ik-far-root, or --noisy-root.")
+    if args.near_tcp_points <= 0 or args.far_tcp_points <= 0:
+        raise ValueError("--near-tcp-points and --far-tcp-points must be positive.")
+    if not 0.0 <= args.near_min <= args.near_max:
+        raise ValueError("Require 0 <= --near-min <= --near-max.")
+    if args.far_min < 0.0 or args.probe_eps <= 0.0:
+        raise ValueError("--far-min must be non-negative and --probe-eps must be positive.")
+    if args.normal_k < 3:
+        raise ValueError("--normal-k must be at least 3.")
+    if args.ik_max_orientations is not None and not 1 <= args.ik_max_orientations <= 12:
+        raise ValueError("--ik-max-orientations must be in [1, 12].")
+    if args.ik_max_solutions <= 0 or args.ik_num_random_seeds < 0 or args.ik_max_random_retries < 0:
+        raise ValueError("IK solution count must be positive and IK retry counts must be non-negative.")
+    if args.noise_sigma < 0.0 or args.noise_clip < 0.0:
+        raise ValueError("--noise-sigma and --noise-clip must be non-negative.")
+    if args.skip_near_ik and args.skip_far_ik and args.skip_noisy_playback:
+        raise ValueError("At least one sample source must remain enabled.")
 
     build_dataset(args)
 

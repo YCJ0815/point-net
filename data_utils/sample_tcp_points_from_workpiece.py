@@ -193,7 +193,13 @@ def generate_tcp_points_from_point_cloud(
     accepted_distance = []
 
     batch_factor = max(6, int(np.ceil(num_points / max(len(points), 1))))
+    batch_round = 0
     while len(accepted_tcp) < num_points:
+        batch_round += 1
+        if batch_round > 100:
+            raise RuntimeError(
+                f"Could only generate {len(accepted_tcp)}/{num_points} valid near-surface TCP points."
+            )
         candidate_count = min(len(points), max(num_points * batch_factor, num_points))
         candidate_idx = farthest_point_sample_numpy(points, candidate_count, seed=int(rng.integers(0, 1_000_000)))
         anchor_points = points[candidate_idx]
@@ -323,7 +329,13 @@ def generate_tcp_points_from_roi_capsule(
     accepted_boundary = []
 
     batch_factor = max(6, int(np.ceil(num_points / max(len(points), 1))))
+    batch_round = 0
     while len(accepted_tcp) < num_points:
+        batch_round += 1
+        if batch_round > 100:
+            raise RuntimeError(
+                f"Could only generate {len(accepted_tcp)}/{num_points} valid ROI far-field TCP points."
+            )
         candidate_count = min(len(points), max(num_points * batch_factor, num_points))
         candidate_idx = farthest_point_sample_numpy(points, candidate_count, seed=int(rng.integers(0, 1_000_000)))
         anchor_points = points[candidate_idx]
@@ -463,7 +475,8 @@ def generate_tcp_orientations(
         for j in range(num_orientations):
             tf = np.eye(4, dtype=np.float64)
             tf[:3, :3] = rot_mats[i, j]
-            quats[i, j] = quaternion_from_matrix(tf).astype(np.float32)
+            quat_wxyz = quaternion_from_matrix(tf)
+            quats[i, j] = quat_wxyz[[1, 2, 3, 0]].astype(np.float32)
 
     return {
         "orientation_matrices": rot_mats,

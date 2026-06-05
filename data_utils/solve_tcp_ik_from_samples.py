@@ -1,5 +1,6 @@
 import argparse
 import math
+import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -284,6 +285,160 @@ def solve_one_pose(
     return solutions, position_errors, orientation_errors
 
 
+class PyBulletIKSolver:
+    """Reusable PyBullet IK solver for in-memory TCP samples."""
+
+    def __init__(self, urdf_path, tcp_link="tool0"):
+        self.p = import_pybullet()
+        self.temp_urdf = make_pybullet_ready_urdf(urdf_path)
+        self.client = self.p.connect(self.p.DIRECT)
+        try:
+            self.robot_id = self.p.loadURDF(str(self.temp_urdf), useFixedBase=True)
+            self.robot_info = extract_robot_info(self.p, self.robot_id, tcp_link)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        if getattr(self, "client", None) is not None:
+            try:
+                self.p.disconnect(self.client)
+            except Exception:
+                pass
+            self.client = None
+        temp_urdf = getattr(self, "temp_urdf", None)
+        if temp_urdf is not None:
+            shutil.rmtree(Path(temp_urdf).parent, ignore_errors=True)
+            self.temp_urdf = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def solve(
+        self,
+        tcp_points,
+        orientation_quaternions_xyzw,
+        *,
+        max_points=None,
+        max_orientations=None,
+        max_solutions=8,
+        num_random_seeds=6,
+        max_random_retries=6,
+        seed=0,
+        joint_tol=0.15,
+        pos_tol=0.005,
+        orn_tol_deg=5.0,
+        max_iterations=240,
+        residual_threshold=1e-5,
+        progress_every=0,
+    ):
+        tcp_points = np.asarray(tcp_points, dtype=np.float64)
+        quats = np.asarray(orientation_quaternions_xyzw, dtype=np.float64)
+        if tcp_points.ndim != 2 or tcp_points.shape[1] != 3:
+            raise ValueError("tcp_points must have shape (N, 3)")
+        if quats.ndim != 3 or quats.shape[0] != len(tcp_points) or quats.shape[2] != 4:
+            raise ValueError("orientation_quaternions_xyzw must have shape (N, M, 4)")
+        if max_points is not None:
+            tcp_points = tcp_points[:max_points]
+            quats = quats[:max_points]
+        if max_orientations is not None:
+            quats = quats[:, :max_orientations]
+
+        robot_info = self.robot_info
+        orn_tol_rad = math.radians(orn_tol_deg)
+        rng = np.random.default_rng(seed)
+        pose_tcp_index = []
+        pose_orientation_index = []
+        pose_target_positions = []
+        pose_target_quaternions = []
+        pose_solution_count = []
+        ik_solutions = []
+        ik_solution_pose_index = []
+        ik_solution_tcp_index = []
+        ik_solution_orientation_index = []
+        ik_position_error = []
+        ik_orientation_error = []
+        carryover_seeds = []
+        pose_index = 0
+        solved_pose_count = 0
+        total_pose_count = int(tcp_points.shape[0] * quats.shape[1])
+
+        for tcp_index in range(tcp_points.shape[0]):
+            point = tcp_points[tcp_index]
+            point_carryover = list(carryover_seeds)
+            for orientation_index in range(quats.shape[1]):
+                quat = normalize_quaternion_xyzw(quats[tcp_index, orientation_index])
+                base_seeds = build_seed_bank(
+                    point,
+                    robot_info["lower_limits"],
+                    robot_info["upper_limits"],
+                    num_random_seeds,
+                    rng,
+                )
+                solutions, pos_errors, orn_errors = solve_one_pose(
+                    p=self.p,
+                    robot_id=self.robot_id,
+                    robot_info=robot_info,
+                    target_position=point,
+                    target_quaternion=quat,
+                    base_seeds=base_seeds,
+                    carryover_seeds=point_carryover,
+                    max_solutions=max_solutions,
+                    max_random_retries=max_random_retries,
+                    joint_tol=joint_tol,
+                    pos_tol=pos_tol,
+                    orn_tol_rad=orn_tol_rad,
+                    max_iterations=max_iterations,
+                    residual_threshold=residual_threshold,
+                    rng=rng,
+                )
+                pose_tcp_index.append(tcp_index)
+                pose_orientation_index.append(orientation_index)
+                pose_target_positions.append(point)
+                pose_target_quaternions.append(quat)
+                pose_solution_count.append(len(solutions))
+                if solutions:
+                    solved_pose_count += 1
+                    point_carryover = [np.asarray(solution, dtype=np.float64) for solution in solutions]
+                    for solution, pos_error, orn_error in zip(solutions, pos_errors, orn_errors):
+                        ik_solutions.append(solution)
+                        ik_solution_pose_index.append(pose_index)
+                        ik_solution_tcp_index.append(tcp_index)
+                        ik_solution_orientation_index.append(orientation_index)
+                        ik_position_error.append(pos_error)
+                        ik_orientation_error.append(orn_error)
+                pose_index += 1
+                if progress_every > 0 and pose_index % progress_every == 0:
+                    print(
+                        f"Processed poses: {pose_index}/{total_pose_count} | "
+                        f"solved: {solved_pose_count} | IK solutions: {len(ik_solutions)}"
+                    )
+            carryover_seeds = point_carryover
+
+        num_joints = len(robot_info["movable_joint_indices"])
+        return {
+            "pose_tcp_index": np.asarray(pose_tcp_index, dtype=np.int32),
+            "pose_orientation_index": np.asarray(pose_orientation_index, dtype=np.int32),
+            "pose_target_positions": np.asarray(pose_target_positions, dtype=np.float64).reshape(-1, 3),
+            "pose_target_quaternions_xyzw": np.asarray(pose_target_quaternions, dtype=np.float64).reshape(-1, 4),
+            "pose_solution_count": np.asarray(pose_solution_count, dtype=np.int32),
+            "ik_solutions": np.asarray(ik_solutions, dtype=np.float64).reshape(-1, num_joints),
+            "ik_solution_pose_index": np.asarray(ik_solution_pose_index, dtype=np.int32),
+            "ik_solution_tcp_index": np.asarray(ik_solution_tcp_index, dtype=np.int32),
+            "ik_solution_orientation_index": np.asarray(ik_solution_orientation_index, dtype=np.int32),
+            "ik_position_error": np.asarray(ik_position_error, dtype=np.float64),
+            "ik_orientation_error_rad": np.asarray(ik_orientation_error, dtype=np.float64),
+            "num_tcp_points": int(tcp_points.shape[0]),
+            "num_orientations": int(quats.shape[1]),
+            "num_poses": int(pose_index),
+            "num_solved_poses": int(solved_pose_count),
+            "num_failed_poses": int(pose_index - solved_pose_count),
+        }
+
+
 def save_results(output_path, input_sample, robot_info, payload):
     save_kwargs = {
         "source_tcp_npz": np.array(str(input_sample["path"]), dtype=str),
@@ -336,7 +491,6 @@ def main():
     parser.add_argument("--progress-every", type=int, default=100, help="Print progress every K poses")
     args = parser.parse_args()
 
-    p = import_pybullet()
     sample = load_tcp_sample_file(args.tcp_samples)
 
     tcp_points = sample["tcp_points"]
@@ -355,111 +509,24 @@ def main():
     sample["tcp_points"] = tcp_points
     sample["orientation_quaternions_xyzw"] = quats
 
-    temp_urdf = make_pybullet_ready_urdf(args.urdf)
-    client = p.connect(p.DIRECT)
-    try:
-        robot_id = p.loadURDF(str(temp_urdf), useFixedBase=True)
-        robot_info = extract_robot_info(p, robot_id, args.tcp_link)
-        orn_tol_rad = math.radians(args.orn_tol_deg)
-        rng = np.random.default_rng(args.seed)
-
-        pose_tcp_index = []
-        pose_orientation_index = []
-        pose_target_positions = []
-        pose_target_quaternions = []
-        pose_solution_count = []
-
-        ik_solutions = []
-        ik_solution_pose_index = []
-        ik_solution_tcp_index = []
-        ik_solution_orientation_index = []
-        ik_position_error = []
-        ik_orientation_error = []
-
-        carryover_seeds = []
-        pose_index = 0
-        solved_pose_count = 0
-        total_pose_count = int(tcp_points.shape[0] * quats.shape[1])
-
-        for tcp_index in range(tcp_points.shape[0]):
-            point = np.asarray(tcp_points[tcp_index], dtype=np.float64)
-            point_carryover = list(carryover_seeds)
-            for orientation_index in range(quats.shape[1]):
-                quat = normalize_quaternion_xyzw(quats[tcp_index, orientation_index])
-                base_seeds = build_seed_bank(
-                    target_position=point,
-                    lower_limits=robot_info["lower_limits"],
-                    upper_limits=robot_info["upper_limits"],
-                    num_random_seeds=args.num_random_seeds,
-                    rng=rng,
-                )
-                solutions, pos_errors, orn_errors = solve_one_pose(
-                    p=p,
-                    robot_id=robot_id,
-                    robot_info=robot_info,
-                    target_position=point,
-                    target_quaternion=quat,
-                    base_seeds=base_seeds,
-                    carryover_seeds=point_carryover,
-                    max_solutions=args.max_solutions,
-                    max_random_retries=args.max_random_retries,
-                    joint_tol=args.joint_tol,
-                    pos_tol=args.pos_tol,
-                    orn_tol_rad=orn_tol_rad,
-                    max_iterations=args.max_iterations,
-                    residual_threshold=args.residual_threshold,
-                    rng=rng,
-                )
-
-                pose_tcp_index.append(tcp_index)
-                pose_orientation_index.append(orientation_index)
-                pose_target_positions.append(point)
-                pose_target_quaternions.append(quat)
-                pose_solution_count.append(len(solutions))
-
-                if solutions:
-                    solved_pose_count += 1
-                    point_carryover = [np.asarray(solution, dtype=np.float64) for solution in solutions]
-                    for solution, pos_error, orn_error in zip(solutions, pos_errors, orn_errors):
-                        ik_solutions.append(solution)
-                        ik_solution_pose_index.append(pose_index)
-                        ik_solution_tcp_index.append(tcp_index)
-                        ik_solution_orientation_index.append(orientation_index)
-                        ik_position_error.append(pos_error)
-                        ik_orientation_error.append(orn_error)
-
-                pose_index += 1
-                if args.progress_every > 0 and pose_index % args.progress_every == 0:
-                    print(
-                        f"Processed poses: {pose_index}/{total_pose_count} | "
-                        f"solved: {solved_pose_count} | "
-                        f"flattened IK solutions: {len(ik_solutions)}"
-                    )
-
-            carryover_seeds = point_carryover
-
-        payload = {
-            "pose_tcp_index": np.asarray(pose_tcp_index, dtype=np.int32),
-            "pose_orientation_index": np.asarray(pose_orientation_index, dtype=np.int32),
-            "pose_target_positions": np.asarray(pose_target_positions, dtype=np.float64),
-            "pose_target_quaternions_xyzw": np.asarray(pose_target_quaternions, dtype=np.float64),
-            "pose_solution_count": np.asarray(pose_solution_count, dtype=np.int32),
-            "ik_solutions": np.asarray(ik_solutions, dtype=np.float64).reshape(-1, len(robot_info["movable_joint_indices"])),
-            "ik_solution_pose_index": np.asarray(ik_solution_pose_index, dtype=np.int32),
-            "ik_solution_tcp_index": np.asarray(ik_solution_tcp_index, dtype=np.int32),
-            "ik_solution_orientation_index": np.asarray(ik_solution_orientation_index, dtype=np.int32),
-            "ik_position_error": np.asarray(ik_position_error, dtype=np.float64),
-            "ik_orientation_error_rad": np.asarray(ik_orientation_error, dtype=np.float64),
-            "num_tcp_points": int(tcp_points.shape[0]),
-            "num_orientations": int(quats.shape[1]),
-            "num_poses": int(pose_index),
-            "num_solved_poses": int(solved_pose_count),
-            "num_failed_poses": int(pose_index - solved_pose_count),
-        }
-
+    with PyBulletIKSolver(args.urdf, tcp_link=args.tcp_link) as solver:
+        payload = solver.solve(
+            tcp_points=tcp_points,
+            orientation_quaternions_xyzw=quats,
+            max_solutions=args.max_solutions,
+            num_random_seeds=args.num_random_seeds,
+            max_random_retries=args.max_random_retries,
+            seed=args.seed,
+            joint_tol=args.joint_tol,
+            pos_tol=args.pos_tol,
+            orn_tol_deg=args.orn_tol_deg,
+            max_iterations=args.max_iterations,
+            residual_threshold=args.residual_threshold,
+            progress_every=args.progress_every,
+        )
         output_path = Path(args.output).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        save_results(output_path, sample, robot_info, payload)
+        save_results(output_path, sample, solver.robot_info, payload)
 
         print(f"Saved IK solutions to: {output_path}")
         print(f"TCP points processed: {payload['num_tcp_points']}")
@@ -468,9 +535,7 @@ def main():
         print(f"Solved poses: {payload['num_solved_poses']}")
         print(f"Failed poses: {payload['num_failed_poses']}")
         print(f"Flattened IK solutions: {len(payload['ik_solutions'])}")
-        print(f"Joint names: {robot_info['movable_joint_names']}")
-    finally:
-        p.disconnect(client)
+        print(f"Joint names: {solver.robot_info['movable_joint_names']}")
 
 
 if __name__ == "__main__":

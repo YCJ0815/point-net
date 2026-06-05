@@ -46,16 +46,13 @@ Each final dataset sample contains:
 
 ### Build the Dataset
 
-The command below builds one final dataset for `job_003`. ROI point clouds are cropped directly from `workpiece.stl` in memory and are not saved. The near-field IK, far-field IK, and noisy expert trajectory roots must contain files with matching `transition_xxxx_xxxx` names.
+The command below builds one final dataset for `job_003`. ROI extraction, near-field TCP sampling, far-field TCP sampling, 12-orientation PyBullet IK, noisy expert trajectories, and SDF labels are all generated in memory. No ROI, TCP, IK, noisy-trajectory, or distance-query intermediate NPZ files are required.
 
 ```shell
 python data_utils/build_pointcloud_joint_input_dataset.py \
   --results-root /Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/results \
   --jobs-root /Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/jobs \
   --job-name job_003 \
-  --ik-near-root data/tcp_ik_near \
-  --ik-far-root data/tcp_ik_far \
-  --noisy-root data/noisy_transition_joint_trajectories \
   --local-points config/robot-model/ur5e_surface_points_local.npz \
   --output data/pointcloud_joint_dataset/job_003.npz \
   --radius-m 0.1 \
@@ -63,11 +60,18 @@ python data_utils/build_pointcloud_joint_input_dataset.py \
   --num-mesh-sample-points 100000 \
   --num-points 512 \
   --point-scale 0.1 \
+  --near-tcp-points 40 \
+  --far-tcp-points 20 \
+  --near-min 0.0 \
+  --near-max 0.02 \
+  --far-min 0.02 \
   --outside-mode project \
   --seed 0
 ```
 
-The workpiece STL is transformed and sampled only once per job, then reused by all matching transitions. By default, the output NPZ only stores the four training fields listed above. Add `--save-metadata` only when source paths, raw joint values, or TCP transforms are needed for debugging. ROI point clouds and SDF distance query results are computed in memory and are not saved as intermediate files.
+Omit `--job-name` to process all `job_*` directories into one dataset. The workpiece STL and SDF are loaded only once per job and reused by all transitions. Use `--max-transitions`, `--near-tcp-points`, `--far-tcp-points`, and `--ik-max-orientations` for a small validation run before starting the full build. The default full build uses 40 near-field TCP points, 20 far-field TCP points, and 12 orientations per TCP point, so its IK and storage cost is high.
+
+By default, the output NPZ only stores the four training fields listed above. Add `--save-metadata` only when raw joint values, source types, or TCP transforms are needed for debugging. Use `--skip-near-ik`, `--skip-far-ik`, or `--skip-noisy-playback` to disable a source explicitly.
 
 ### Train the Fusion Model
 
