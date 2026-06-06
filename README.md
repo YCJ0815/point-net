@@ -71,7 +71,22 @@ python data_utils/build_pointcloud_joint_input_dataset.py \
 
 Omit `--job-name` to process all `job_*` directories into one dataset. The workpiece STL and SDF are loaded only once per job and reused by all transitions. Use `--max-transitions`, `--near-tcp-points`, `--far-tcp-points`, and `--ik-max-orientations` for a small validation run before starting the full build. The default full build uses 40 near-field TCP points, 20 far-field TCP points, and 12 orientations per TCP point, so its IK and storage cost is high.
 
-By default, the output NPZ only stores the four training fields listed above. Add `--save-metadata` only when raw joint values, source types, or TCP transforms are needed for debugging. Use `--skip-near-ik`, `--skip-far-ik`, or `--skip-noisy-playback` to disable a source explicitly.
+For large full-dataset builds, prefer streaming shards instead of one giant NPZ. The command below writes one shard per transition and a resumable manifest:
+
+```shell
+python data_utils/build_pointcloud_joint_input_dataset.py \
+  --results-root /Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/results \
+  --jobs-root /Users/ycj/Desktop/Research/Warmup/DiffusionPolicyPathplanning/3D-Diffusion-Policy/data/raw_data/jobs \
+  --local-points config/robot-model/ur5e_surface_points_local.npz \
+  --shard-output-dir data/pointcloud_joint_dataset/all_jobs_shards \
+  --output data/pointcloud_joint_dataset/all_jobs_manifest.json \
+  --resume \
+  --ik-progress-every 1 \
+  --distance-progress-every 10 \
+  --seed 0
+```
+
+By default, the output NPZ only stores the four training fields listed above. Add `--save-metadata` only when raw joint values, source types, or TCP transforms are needed for debugging. Use `--skip-near-ik`, `--skip-far-ik`, or `--skip-noisy-playback` to disable a source explicitly. `--ik-progress-every` and `--distance-progress-every` are useful when the build appears silent.
 
 ### Train the Fusion Model
 
@@ -91,6 +106,8 @@ python train_joint_collision_distance.py \
   --device auto \
   --seed 0
 ```
+
+The same training script also accepts a shard manifest path such as `data/pointcloud_joint_dataset/all_jobs_manifest.json`.
 
 The best validation checkpoint is saved to:
 

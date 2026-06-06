@@ -1,6 +1,8 @@
 import argparse
 import math
+import os
 import shutil
+import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -15,7 +17,7 @@ except ImportError:
 install_numpy_pickle_compat()
 
 
-PYBULLET_PYTHON = "/Users/ycj/miniconda3/envs/pybullet/bin/python"
+PYBULLET_PYTHON = os.environ.get("PYBULLET_PYTHON", "python")
 
 
 def import_pybullet():
@@ -24,7 +26,9 @@ def import_pybullet():
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "pybullet is not available in the current interpreter. "
-            f"Run this script with {PYBULLET_PYTHON}."
+            f"Current interpreter: {sys.executable}. "
+            "Run this script with a Python environment that already has pybullet installed, "
+            "or set PYBULLET_PYTHON to that interpreter path."
         ) from exc
     return p
 

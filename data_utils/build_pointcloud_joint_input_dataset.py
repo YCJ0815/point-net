@@ -1,4 +1,5 @@
 import argparse
+import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -56,6 +57,150 @@ DEFAULT_JOINT_NAMES = (
     "wrist_2_joint",
     "wrist_3_joint",
 )
+
+
+REQUIRED_DATASET_FIELDS = (
+    "point_clouds",
+    "joint_features",
+    "collision_labels",
+    "min_distance_norm",
+)
+
+
+def write_dataset_npz(output_path, dataset):
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output_path, **dataset)
+    return output_path
+
+
+def dataset_sample_count(dataset):
+    return int(dataset["point_clouds"].shape[0])
+
+
+def empty_dataset_dict(args):
+    dataset = {
+        "point_clouds": np.zeros((0, args.num_points, 3), dtype=np.float32),
+        "joint_features": np.zeros((0, 18), dtype=np.float32),
+        "collision_labels": np.zeros((0,), dtype=np.int64),
+        "min_distance_norm": np.zeros((0,), dtype=np.float32),
+    }
+    if args.save_metadata:
+        dataset.update(
+            {
+                "q_start": np.zeros((0, 6), dtype=np.float32),
+                "q_sample": np.zeros((0, 6), dtype=np.float32),
+                "delta_q": np.zeros((0, 6), dtype=np.float32),
+                "joint_source": np.asarray([], dtype=str),
+                "source_transition_npz": np.asarray([], dtype=str),
+                "source_joint_npz": np.asarray([], dtype=str),
+                "source_workpiece_stl": np.asarray([], dtype=str),
+                "joint_limits_lower": np.zeros((6,), dtype=np.float32),
+                "joint_limits_upper": np.zeros((6,), dtype=np.float32),
+                "canonical_start_tf": np.zeros((0, 4, 4), dtype=np.float32),
+                "transition_index": np.asarray([], dtype=np.int32),
+                "joint_index_in_source": np.asarray([], dtype=np.int32),
+                "num_points": np.array(args.num_points, dtype=np.int32),
+                "point_scale": np.array(args.point_scale, dtype=np.float32),
+                "seed": np.array(args.seed, dtype=np.int32),
+            }
+        )
+    return dataset
+
+
+def build_dataset_from_transition_results(args, joint_limits_lower, joint_limits_upper, transition_results):
+    point_clouds = []
+    joint_features = []
+    collision_labels = []
+    min_distance_norm = []
+    if args.save_metadata:
+        q_start = []
+        q_sample = []
+        delta_q = []
+        canonical_start_tf = []
+        joint_source = []
+        source_transition_npz = []
+        source_joint_npz = []
+        source_workpiece_stl = []
+        transition_index = []
+        joint_index_in_source = []
+
+    for transition_result in transition_results:
+        for block in transition_result["blocks"]:
+            count = block["joint_features"].shape[0]
+            point_clouds.append(block["point_clouds"])
+            joint_features.append(block["joint_features"])
+            collision_labels.append(block["collision_labels"])
+            min_distance_norm.append(block["min_distance_norm"])
+            if args.save_metadata:
+                q_start.append(block["q_start"])
+                q_sample.append(block["q_sample"])
+                delta_q.append(block["delta_q"])
+                canonical_start_tf.append(block["canonical_start_tf"])
+                joint_source.extend([block["source_kind"]] * count)
+                source_transition_npz.extend([transition_result["transition_path"]] * count)
+                source_joint_npz.extend([block["source_path"]] * count)
+                source_workpiece_stl.extend([transition_result["stl_path"]] * count)
+                transition_index.extend([transition_result["transition_index"]] * count)
+                joint_index_in_source.extend(block["source_indices"].tolist())
+
+    dataset = {
+        "point_clouds": concatenate_or_empty(point_clouds, (0, args.num_points, 3), np.float32),
+        "joint_features": concatenate_or_empty(joint_features, (0, 18), np.float32),
+        "collision_labels": concatenate_or_empty(collision_labels, (0,), np.int64),
+        "min_distance_norm": concatenate_or_empty(min_distance_norm, (0,), np.float32),
+    }
+    if args.save_metadata:
+        dataset.update(
+            {
+                "q_start": concatenate_or_empty(q_start, (0, 6), np.float32),
+                "q_sample": concatenate_or_empty(q_sample, (0, 6), np.float32),
+                "delta_q": concatenate_or_empty(delta_q, (0, 6), np.float32),
+                "joint_source": np.asarray(joint_source, dtype=str),
+                "source_transition_npz": np.asarray(source_transition_npz, dtype=str),
+                "source_joint_npz": np.asarray(source_joint_npz, dtype=str),
+                "source_workpiece_stl": np.asarray(source_workpiece_stl, dtype=str),
+                "joint_limits_lower": joint_limits_lower.astype(np.float32),
+                "joint_limits_upper": joint_limits_upper.astype(np.float32),
+                "canonical_start_tf": concatenate_or_empty(canonical_start_tf, (0, 4, 4), np.float32),
+                "transition_index": np.asarray(transition_index, dtype=np.int32),
+                "joint_index_in_source": np.asarray(joint_index_in_source, dtype=np.int32),
+                "num_points": np.array(args.num_points, dtype=np.int32),
+                "point_scale": np.array(args.point_scale, dtype=np.float32),
+                "seed": np.array(args.seed, dtype=np.int32),
+            }
+        )
+    return dataset
+
+
+def sanitize_transition_name(transition_path):
+    path = Path(transition_path)
+    return f"{path.parent.name}__{path.stem}"
+
+
+def write_transition_shard(shard_output_dir, transition_result, dataset):
+    shard_output_dir = Path(shard_output_dir).resolve()
+    shard_output_dir.mkdir(parents=True, exist_ok=True)
+    shard_path = shard_output_dir / f"{transition_result['transition_index']:06d}_{sanitize_transition_name(transition_result['transition_path'])}.npz"
+    write_dataset_npz(shard_path, dataset)
+    return shard_path
+
+
+def write_shard_manifest(manifest_path, args, transition_files, shard_records, totals):
+    manifest_path = Path(manifest_path).resolve()
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format": "pointcloud_joint_dataset_manifest_v1",
+        "required_fields": list(REQUIRED_DATASET_FIELDS),
+        "save_metadata": bool(args.save_metadata),
+        "results_root": str(Path(args.results_root).resolve()),
+        "jobs_root": str(Path(args.jobs_root).resolve()),
+        "transition_files_found": int(len(transition_files)),
+        "shards": shard_records,
+        "totals": totals,
+    }
+    manifest_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return manifest_path
 def find_job_dir(root, job_name):
     root = Path(root).resolve()
     if job_name is None:
@@ -421,6 +566,12 @@ def build_dataset(args):
     transition_files = collect_transition_files(args.results_root, args.job_name, args.transition_name)
     if args.max_transitions is not None:
         transition_files = transition_files[: args.max_transitions]
+    print(f"transition_files_found: {len(transition_files)}")
+    if args.shard_output_dir:
+        print(f"shard_output_dir: {Path(args.shard_output_dir).resolve()}")
+    if args.output:
+        print(f"output_target: {Path(args.output).resolve()}")
+    print("initializing_distance_query...")
     distance_query = RobotWorkpieceDistanceQuery(
         urdf_path=args.urdf,
         local_points_path=args.local_points,
@@ -428,12 +579,14 @@ def build_dataset(args):
         min_points_per_link=args.distance_min_points_per_link,
         seed=args.seed,
     )
+    print("distance_query_ready")
 
-    point_clouds = []
-    joint_features = []
-    collision_labels = []
-    min_distance_norm = []
-    if args.save_metadata:
+    stream_to_shards = args.shard_output_dir is not None
+    point_clouds = [] if not stream_to_shards else None
+    joint_features = [] if not stream_to_shards else None
+    collision_labels = [] if not stream_to_shards else None
+    min_distance_norm = [] if not stream_to_shards else None
+    if args.save_metadata and not stream_to_shards:
         q_start = []
         q_sample = []
         delta_q = []
@@ -449,13 +602,46 @@ def build_dataset(args):
     source_sample_counts = {"ik_near": 0, "ik_far": 0, "noisy_playback": 0}
     job_surface_cache = {}
     sdf_meta_cache = {}
+    shard_records = []
+    skipped_existing_shards = 0
     ik_solver = None
     if not args.skip_near_ik or not args.skip_far_ik:
+        print("initializing_ik_solver...")
         ik_solver = PyBulletIKSolver(args.urdf, tcp_link=args.tcp_link)
+        print("ik_solver_ready")
 
     processed_transitions = 0
     try:
         for transition_index_value, transition_path in enumerate(transition_files):
+            if stream_to_shards:
+                existing_shard_path = (
+                    Path(args.shard_output_dir).resolve()
+                    / f"{transition_index_value:06d}_{sanitize_transition_name(transition_path)}.npz"
+                )
+                if args.resume and existing_shard_path.is_file():
+                    with np.load(existing_shard_path, allow_pickle=True) as existing_data:
+                        shard_sample_count = int(existing_data["point_clouds"].shape[0])
+                    shard_records.append(
+                        {
+                            "transition_index": transition_index_value,
+                            "transition_path": str(Path(transition_path).resolve()),
+                            "shard_path": str(existing_shard_path),
+                            "samples": shard_sample_count,
+                            "status": "reused",
+                        }
+                    )
+                    skipped_existing_shards += 1
+                    print(
+                        f"reused_shard: {existing_shard_path.name} | "
+                        f"transition {transition_index_value + 1}/{len(transition_files)} | "
+                        f"samples: {shard_sample_count}"
+                    )
+                    continue
+
+            print(
+                f"processing_transition: {transition_index_value + 1}/{len(transition_files)} | "
+                f"{Path(transition_path).parent.name}/{Path(transition_path).name}"
+            )
             try:
                 job_dir, stl_path, sdf_path = resolve_job_assets(args.jobs_root, transition_path)
                 if job_dir not in job_surface_cache:
@@ -479,76 +665,132 @@ def build_dataset(args):
                     ik_solver=ik_solver,
                     transition_seed=args.seed + transition_index_value * 1009,
                 )
+                result["transition_index"] = transition_index_value
                 processed_transitions += 1
                 failures.extend(result["failures"])
                 skipped_invalid_distance += result["skipped_invalid_distance"]
                 for block in result["blocks"]:
-                    count = block["joint_features"].shape[0]
-                    source_sample_counts[block["source_kind"]] += count
-                    point_clouds.append(block["point_clouds"])
-                    joint_features.append(block["joint_features"])
-                    collision_labels.append(block["collision_labels"])
-                    min_distance_norm.append(block["min_distance_norm"])
-                    if args.save_metadata:
-                        q_start.append(block["q_start"])
-                        q_sample.append(block["q_sample"])
-                        delta_q.append(block["delta_q"])
-                        canonical_start_tf.append(block["canonical_start_tf"])
-                        joint_source.extend([block["source_kind"]] * count)
-                        source_transition_npz.extend([result["transition_path"]] * count)
-                        source_joint_npz.extend([block["source_path"]] * count)
-                        source_workpiece_stl.extend([result["stl_path"]] * count)
-                        transition_index.extend([transition_index_value] * count)
-                        joint_index_in_source.extend(block["source_indices"].tolist())
+                    source_sample_counts[block["source_kind"]] += block["joint_features"].shape[0]
+
+                if stream_to_shards:
+                    shard_dataset = build_dataset_from_transition_results(
+                        args=args,
+                        joint_limits_lower=joint_limits_lower,
+                        joint_limits_upper=joint_limits_upper,
+                        transition_results=[result],
+                    )
+                    shard_sample_count = dataset_sample_count(shard_dataset)
+                    shard_path = write_transition_shard(args.shard_output_dir, result, shard_dataset)
+                    shard_records.append(
+                        {
+                            "transition_index": transition_index_value,
+                            "transition_path": result["transition_path"],
+                            "shard_path": str(shard_path),
+                            "samples": shard_sample_count,
+                            "status": "written",
+                        }
+                    )
+                    print(
+                        f"saved_shard: {shard_path.name} | "
+                        f"transition {transition_index_value + 1}/{len(transition_files)} | "
+                        f"samples: {shard_sample_count}"
+                    )
+                else:
+                    for block in result["blocks"]:
+                        count = block["joint_features"].shape[0]
+                        point_clouds.append(block["point_clouds"])
+                        joint_features.append(block["joint_features"])
+                        collision_labels.append(block["collision_labels"])
+                        min_distance_norm.append(block["min_distance_norm"])
+                        if args.save_metadata:
+                            q_start.append(block["q_start"])
+                            q_sample.append(block["q_sample"])
+                            delta_q.append(block["delta_q"])
+                            canonical_start_tf.append(block["canonical_start_tf"])
+                            joint_source.extend([block["source_kind"]] * count)
+                            source_transition_npz.extend([result["transition_path"]] * count)
+                            source_joint_npz.extend([block["source_path"]] * count)
+                            source_workpiece_stl.extend([result["stl_path"]] * count)
+                            transition_index.extend([transition_index_value] * count)
+                            joint_index_in_source.extend(block["source_indices"].tolist())
             except Exception as exc:
                 failures.append((str(transition_path), str(exc)))
     finally:
         if ik_solver is not None:
             ik_solver.close()
 
-    dataset = {
-        "point_clouds": concatenate_or_empty(point_clouds, (0, args.num_points, 3), np.float32),
-        "joint_features": concatenate_or_empty(joint_features, (0, 18), np.float32),
-        "collision_labels": concatenate_or_empty(collision_labels, (0,), np.int64),
-        "min_distance_norm": concatenate_or_empty(min_distance_norm, (0,), np.float32),
-    }
-    if args.save_metadata:
-        dataset.update(
-            {
-                "q_start": concatenate_or_empty(q_start, (0, 6), np.float32),
-                "q_sample": concatenate_or_empty(q_sample, (0, 6), np.float32),
-                "delta_q": concatenate_or_empty(delta_q, (0, 6), np.float32),
-                "joint_source": np.asarray(joint_source, dtype=str),
-                "source_transition_npz": np.asarray(source_transition_npz, dtype=str),
-                "source_joint_npz": np.asarray(source_joint_npz, dtype=str),
-                "source_workpiece_stl": np.asarray(source_workpiece_stl, dtype=str),
-                "joint_limits_lower": joint_limits_lower.astype(np.float32),
-                "joint_limits_upper": joint_limits_upper.astype(np.float32),
-                "canonical_start_tf": concatenate_or_empty(canonical_start_tf, (0, 4, 4), np.float32),
-                "transition_index": np.asarray(transition_index, dtype=np.int32),
-                "joint_index_in_source": np.asarray(joint_index_in_source, dtype=np.int32),
-                "num_points": np.array(args.num_points, dtype=np.int32),
-                "point_scale": np.array(args.point_scale, dtype=np.float32),
-                "seed": np.array(args.seed, dtype=np.int32),
-            }
+    if stream_to_shards:
+        total_samples = int(sum(record["samples"] for record in shard_records))
+        totals = {
+            "processed_transitions": int(processed_transitions),
+            "reused_shards": int(skipped_existing_shards),
+            "workpiece_surfaces_sampled": int(len(job_surface_cache)),
+            "samples": total_samples,
+            "source_samples": {key: int(value) for key, value in source_sample_counts.items()},
+            "skipped_invalid_distance": int(skipped_invalid_distance),
+            "failures": int(len(failures)),
+        }
+        manifest_output = (
+            Path(args.output).resolve()
+            if args.output
+            else Path(args.shard_output_dir).resolve() / "manifest.json"
         )
+        manifest_path = write_shard_manifest(
+            manifest_output,
+            args=args,
+            transition_files=transition_files,
+            shard_records=shard_records,
+            totals=totals,
+        )
+        dataset = empty_dataset_dict(args)
+        print(f"saved_manifest: {manifest_path}")
+        print(f"shards_written_or_reused: {len(shard_records)}")
+        print(f"samples: {total_samples}")
+    else:
+        dataset = {
+            "point_clouds": concatenate_or_empty(point_clouds, (0, args.num_points, 3), np.float32),
+            "joint_features": concatenate_or_empty(joint_features, (0, 18), np.float32),
+            "collision_labels": concatenate_or_empty(collision_labels, (0,), np.int64),
+            "min_distance_norm": concatenate_or_empty(min_distance_norm, (0,), np.float32),
+        }
+        if args.save_metadata:
+            dataset.update(
+                {
+                    "q_start": concatenate_or_empty(q_start, (0, 6), np.float32),
+                    "q_sample": concatenate_or_empty(q_sample, (0, 6), np.float32),
+                    "delta_q": concatenate_or_empty(delta_q, (0, 6), np.float32),
+                    "joint_source": np.asarray(joint_source, dtype=str),
+                    "source_transition_npz": np.asarray(source_transition_npz, dtype=str),
+                    "source_joint_npz": np.asarray(source_joint_npz, dtype=str),
+                    "source_workpiece_stl": np.asarray(source_workpiece_stl, dtype=str),
+                    "joint_limits_lower": joint_limits_lower.astype(np.float32),
+                    "joint_limits_upper": joint_limits_upper.astype(np.float32),
+                    "canonical_start_tf": concatenate_or_empty(canonical_start_tf, (0, 4, 4), np.float32),
+                    "transition_index": np.asarray(transition_index, dtype=np.int32),
+                    "joint_index_in_source": np.asarray(joint_index_in_source, dtype=np.int32),
+                    "num_points": np.array(args.num_points, dtype=np.int32),
+                    "point_scale": np.array(args.point_scale, dtype=np.float32),
+                    "seed": np.array(args.seed, dtype=np.int32),
+                }
+            )
 
-    output_path = Path(args.output).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output_path, **dataset)
+        output_path = write_dataset_npz(args.output, dataset)
+        print(f"saved: {output_path}")
 
-    print(f"saved: {output_path}")
-    print(f"transition_files_found: {len(transition_files)}")
     print(f"transition_files_processed: {processed_transitions}")
     print(f"workpiece_surfaces_sampled: {len(job_surface_cache)}")
-    print(f"samples: {dataset['point_clouds'].shape[0]}")
+    print(f"samples: {dataset_sample_count(dataset) if not stream_to_shards else total_samples}")
     print(f"source_samples: {source_sample_counts}")
-    print(f"point_clouds: {dataset['point_clouds'].shape}")
-    print(f"joint_features: {dataset['joint_features'].shape}")
-    print(f"collision_labels: {dataset['collision_labels'].shape}")
-    print(f"min_distance_norm: {dataset['min_distance_norm'].shape}")
+    if not stream_to_shards:
+        print(f"point_clouds: {dataset['point_clouds'].shape}")
+        print(f"joint_features: {dataset['joint_features'].shape}")
+        print(f"collision_labels: {dataset['collision_labels'].shape}")
+        print(f"min_distance_norm: {dataset['min_distance_norm'].shape}")
     print(f"skipped_invalid_distance: {skipped_invalid_distance}")
     print(f"save_metadata: {args.save_metadata}")
+    if stream_to_shards:
+        print(f"resume_enabled: {args.resume}")
+        print(f"reused_shards: {skipped_existing_shards}")
     print(f"failures: {len(failures)}")
     if failures:
         print("failure_examples:")
@@ -563,7 +805,9 @@ def main():
     parser.add_argument("--job-name", type=str, default=None, help="Optional job name, e.g. job_003")
     parser.add_argument("--transition-name", type=str, default=None, help="Optional transition stem, e.g. transition_0012_0053")
     parser.add_argument("--max-transitions", type=int, default=None, help="Only process the first N transitions for debugging")
-    parser.add_argument("--output", type=str, required=True, help="Output dataset npz path")
+    parser.add_argument("--output", type=str, default=None, help="Output dataset npz path, or manifest path when using --shard-output-dir")
+    parser.add_argument("--shard-output-dir", type=str, default=None, help="Optional directory to stream one dataset shard per transition and write a manifest")
+    parser.add_argument("--resume", action="store_true", help="When using --shard-output-dir, reuse existing shard files and continue writing the manifest")
     parser.add_argument("--urdf", type=str, default=DEFAULT_URDF, help="Robot URDF path used for joint limits")
     parser.add_argument("--local-points", type=str, default=DEFAULT_LOCAL_POINTS, help="Link-local robot surface point cache; sampled in memory if missing")
     parser.add_argument("--radius-m", type=float, default=0.1, help="XY capsule radius used for in-memory ROI cropping")
@@ -605,6 +849,8 @@ def main():
 
     if args.num_points <= 0:
         raise ValueError("--num-points must be positive.")
+    if args.output is None and args.shard_output_dir is None:
+        raise ValueError("Provide --output for single-file mode, or --shard-output-dir for streaming mode.")
     if args.max_transitions is not None and args.max_transitions <= 0:
         raise ValueError("--max-transitions must be positive.")
     if args.radius_m <= 0:
@@ -637,6 +883,8 @@ def main():
         raise ValueError("--noise-sigma and --noise-clip must be non-negative.")
     if args.skip_near_ik and args.skip_far_ik and args.skip_noisy_playback:
         raise ValueError("At least one sample source must remain enabled.")
+    if args.resume and args.shard_output_dir is None:
+        raise ValueError("--resume requires --shard-output-dir.")
 
     build_dataset(args)
 

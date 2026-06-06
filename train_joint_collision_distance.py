@@ -12,7 +12,7 @@ from models.pointnet_joint_collision_distance import get_loss, get_model
 
 def parse_args():
     parser = argparse.ArgumentParser("train_joint_collision_distance")
-    parser.add_argument("--dataset", type=str, required=True, help="Dataset npz produced by build_pointcloud_joint_input_dataset.py")
+    parser.add_argument("--dataset", type=str, required=True, help="Dataset .npz or shard manifest .json produced by build_pointcloud_joint_input_dataset.py")
     parser.add_argument("--output-dir", type=str, default="log/joint_collision_distance", help="Checkpoint and log output directory")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
