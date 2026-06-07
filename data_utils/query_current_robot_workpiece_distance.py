@@ -244,7 +244,7 @@ class RobotWorkpieceDistanceQuery:
             min_abs_distance[idx] = result["min_abs_distance"]
 
             if progress_every > 0 and (idx + 1) % progress_every == 0:
-                print(f"distance_queries: {idx + 1}/{count}")
+                print(f"distance_queries: {idx + 1}/{count}", flush=True)
 
         return {
             "min_signed_distance": min_signed_distance,

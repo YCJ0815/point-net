@@ -1,5 +1,7 @@
 import argparse
 import json
+import resource
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -65,6 +67,17 @@ REQUIRED_DATASET_FIELDS = (
     "collision_labels",
     "min_distance_norm",
 )
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def peak_memory_mb():
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return usage / 1024 / 1024
+    return usage / 1024
 
 
 def write_dataset_npz(output_path, dataset):
@@ -437,6 +450,11 @@ def process_one_transition(
                 np.arange(len(ik_result["ik_solutions"]), dtype=np.int32),
             )
         )
+        log(
+            f"source_ready: {source_kind} | "
+            f"ik_solutions: {len(ik_result['ik_solutions'])} | "
+            f"peak_rss_mb: {peak_memory_mb():.1f}"
+        )
 
     if not args.skip_near_ik:
         try:
@@ -491,6 +509,11 @@ def process_one_transition(
             generated_sources.append(
                 ("noisy_playback", q_noisy, np.arange(len(q_noisy), dtype=np.int32))
             )
+            log(
+                f"source_ready: noisy_playback | "
+                f"samples: {len(q_noisy)} | "
+                f"peak_rss_mb: {peak_memory_mb():.1f}"
+            )
         except Exception as exc:
             failures.append((f"{transition_path}:noisy_playback", str(exc)))
 
@@ -500,6 +523,11 @@ def process_one_transition(
         if len(q_samples) == 0:
             continue
         try:
+            log(
+                f"distance_start: {source_kind} | "
+                f"samples: {len(q_samples)} | "
+                f"peak_rss_mb: {peak_memory_mb():.1f}"
+            )
             distance_result = distance_query.query_joint_values(
                 joint_values=q_samples,
                 sdf_path=sdf_path,
@@ -543,6 +571,11 @@ def process_one_transition(
                     }
                 )
             blocks.append(block)
+            log(
+                f"distance_done: {source_kind} | "
+                f"valid_samples: {count} | "
+                f"peak_rss_mb: {peak_memory_mb():.1f}"
+            )
         except Exception as exc:
             failures.append((f"{transition_path}:{source_kind}:distance", str(exc)))
 
@@ -566,12 +599,17 @@ def build_dataset(args):
     transition_files = collect_transition_files(args.results_root, args.job_name, args.transition_name)
     if args.max_transitions is not None:
         transition_files = transition_files[: args.max_transitions]
-    print(f"transition_files_found: {len(transition_files)}")
+    log(f"transition_files_found: {len(transition_files)}")
     if args.shard_output_dir:
-        print(f"shard_output_dir: {Path(args.shard_output_dir).resolve()}")
+        log(f"shard_output_dir: {Path(args.shard_output_dir).resolve()}")
     if args.output:
-        print(f"output_target: {Path(args.output).resolve()}")
-    print("initializing_distance_query...")
+        log(f"output_target: {Path(args.output).resolve()}")
+    if args.shard_output_dir is None and args.job_name is None and args.max_transitions is None:
+        log(
+            "warning: full all-jobs single-file mode keeps all samples in memory; "
+            "use --shard-output-dir for full dataset builds."
+        )
+    log("initializing_distance_query...")
     distance_query = RobotWorkpieceDistanceQuery(
         urdf_path=args.urdf,
         local_points_path=args.local_points,
@@ -579,9 +617,16 @@ def build_dataset(args):
         min_points_per_link=args.distance_min_points_per_link,
         seed=args.seed,
     )
-    print("distance_query_ready")
+    log("distance_query_ready")
 
     stream_to_shards = args.shard_output_dir is not None
+    manifest_output = None
+    if stream_to_shards:
+        manifest_output = (
+            Path(args.output).resolve()
+            if args.output
+            else Path(args.shard_output_dir).resolve() / "manifest.json"
+        )
     point_clouds = [] if not stream_to_shards else None
     joint_features = [] if not stream_to_shards else None
     collision_labels = [] if not stream_to_shards else None
@@ -606,11 +651,33 @@ def build_dataset(args):
     skipped_existing_shards = 0
     ik_solver = None
     if not args.skip_near_ik or not args.skip_far_ik:
-        print("initializing_ik_solver...")
+        log("initializing_ik_solver...")
         ik_solver = PyBulletIKSolver(args.urdf, tcp_link=args.tcp_link)
-        print("ik_solver_ready")
+        log("ik_solver_ready")
 
     processed_transitions = 0
+
+    def write_partial_manifest():
+        if not stream_to_shards:
+            return None
+        totals = {
+            "processed_transitions": int(processed_transitions),
+            "reused_shards": int(skipped_existing_shards),
+            "workpiece_surfaces_sampled": int(len(job_surface_cache)),
+            "samples": int(sum(record["samples"] for record in shard_records)),
+            "source_samples": {key: int(value) for key, value in source_sample_counts.items()},
+            "skipped_invalid_distance": int(skipped_invalid_distance),
+            "failures": int(len(failures)),
+            "peak_rss_mb": round(peak_memory_mb(), 1),
+        }
+        return write_shard_manifest(
+            manifest_output,
+            args=args,
+            transition_files=transition_files,
+            shard_records=shard_records,
+            totals=totals,
+        )
+
     try:
         for transition_index_value, transition_path in enumerate(transition_files):
             if stream_to_shards:
@@ -631,25 +698,29 @@ def build_dataset(args):
                         }
                     )
                     skipped_existing_shards += 1
-                    print(
+                    write_partial_manifest()
+                    log(
                         f"reused_shard: {existing_shard_path.name} | "
                         f"transition {transition_index_value + 1}/{len(transition_files)} | "
-                        f"samples: {shard_sample_count}"
+                        f"samples: {shard_sample_count} | "
+                        f"peak_rss_mb: {peak_memory_mb():.1f}"
                     )
                     continue
 
-            print(
+            log(
                 f"processing_transition: {transition_index_value + 1}/{len(transition_files)} | "
-                f"{Path(transition_path).parent.name}/{Path(transition_path).name}"
+                f"{Path(transition_path).parent.name}/{Path(transition_path).name} | "
+                f"peak_rss_mb: {peak_memory_mb():.1f}"
             )
             try:
                 job_dir, stl_path, sdf_path = resolve_job_assets(args.jobs_root, transition_path)
                 if job_dir not in job_surface_cache:
                     job_surface_cache[job_dir] = load_job_surface_points(job_dir, stl_path, args)
                     sdf_meta_cache[job_dir] = load_sdf_metadata(sdf_path)
-                    print(
+                    log(
                         f"sampled_workpiece_surface: {job_dir.name} | "
-                        f"points: {len(job_surface_cache[job_dir])}"
+                        f"points: {len(job_surface_cache[job_dir])} | "
+                        f"peak_rss_mb: {peak_memory_mb():.1f}"
                     )
 
                 result = process_one_transition(
@@ -690,10 +761,12 @@ def build_dataset(args):
                             "status": "written",
                         }
                     )
-                    print(
+                    write_partial_manifest()
+                    log(
                         f"saved_shard: {shard_path.name} | "
                         f"transition {transition_index_value + 1}/{len(transition_files)} | "
-                        f"samples: {shard_sample_count}"
+                        f"samples: {shard_sample_count} | "
+                        f"peak_rss_mb: {peak_memory_mb():.1f}"
                     )
                 else:
                     for block in result["blocks"]:
@@ -730,11 +803,6 @@ def build_dataset(args):
             "skipped_invalid_distance": int(skipped_invalid_distance),
             "failures": int(len(failures)),
         }
-        manifest_output = (
-            Path(args.output).resolve()
-            if args.output
-            else Path(args.shard_output_dir).resolve() / "manifest.json"
-        )
         manifest_path = write_shard_manifest(
             manifest_output,
             args=args,
@@ -743,9 +811,9 @@ def build_dataset(args):
             totals=totals,
         )
         dataset = empty_dataset_dict(args)
-        print(f"saved_manifest: {manifest_path}")
-        print(f"shards_written_or_reused: {len(shard_records)}")
-        print(f"samples: {total_samples}")
+        log(f"saved_manifest: {manifest_path}")
+        log(f"shards_written_or_reused: {len(shard_records)}")
+        log(f"samples: {total_samples}")
     else:
         dataset = {
             "point_clouds": concatenate_or_empty(point_clouds, (0, args.num_points, 3), np.float32),
@@ -775,27 +843,28 @@ def build_dataset(args):
             )
 
         output_path = write_dataset_npz(args.output, dataset)
-        print(f"saved: {output_path}")
+        log(f"saved: {output_path}")
 
-    print(f"transition_files_processed: {processed_transitions}")
-    print(f"workpiece_surfaces_sampled: {len(job_surface_cache)}")
-    print(f"samples: {dataset_sample_count(dataset) if not stream_to_shards else total_samples}")
-    print(f"source_samples: {source_sample_counts}")
+    log(f"transition_files_processed: {processed_transitions}")
+    log(f"workpiece_surfaces_sampled: {len(job_surface_cache)}")
+    log(f"samples: {dataset_sample_count(dataset) if not stream_to_shards else total_samples}")
+    log(f"source_samples: {source_sample_counts}")
     if not stream_to_shards:
-        print(f"point_clouds: {dataset['point_clouds'].shape}")
-        print(f"joint_features: {dataset['joint_features'].shape}")
-        print(f"collision_labels: {dataset['collision_labels'].shape}")
-        print(f"min_distance_norm: {dataset['min_distance_norm'].shape}")
-    print(f"skipped_invalid_distance: {skipped_invalid_distance}")
-    print(f"save_metadata: {args.save_metadata}")
+        log(f"point_clouds: {dataset['point_clouds'].shape}")
+        log(f"joint_features: {dataset['joint_features'].shape}")
+        log(f"collision_labels: {dataset['collision_labels'].shape}")
+        log(f"min_distance_norm: {dataset['min_distance_norm'].shape}")
+    log(f"skipped_invalid_distance: {skipped_invalid_distance}")
+    log(f"save_metadata: {args.save_metadata}")
     if stream_to_shards:
-        print(f"resume_enabled: {args.resume}")
-        print(f"reused_shards: {skipped_existing_shards}")
-    print(f"failures: {len(failures)}")
+        log(f"resume_enabled: {args.resume}")
+        log(f"reused_shards: {skipped_existing_shards}")
+    log(f"peak_rss_mb: {peak_memory_mb():.1f}")
+    log(f"failures: {len(failures)}")
     if failures:
-        print("failure_examples:")
+        log("failure_examples:")
         for path, reason in failures[:10]:
-            print(f"{path} -> {reason}")
+            log(f"{path} -> {reason}")
 
 
 def main():

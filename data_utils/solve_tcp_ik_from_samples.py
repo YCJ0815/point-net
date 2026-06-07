@@ -418,7 +418,8 @@ class PyBulletIKSolver:
                 if progress_every > 0 and pose_index % progress_every == 0:
                     print(
                         f"Processed poses: {pose_index}/{total_pose_count} | "
-                        f"solved: {solved_pose_count} | IK solutions: {len(ik_solutions)}"
+                        f"solved: {solved_pose_count} | IK solutions: {len(ik_solutions)}",
+                        flush=True,
                     )
             carryover_seeds = point_carryover
 
