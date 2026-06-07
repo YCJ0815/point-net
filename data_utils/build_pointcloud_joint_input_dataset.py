@@ -88,7 +88,7 @@ def write_dataset_npz(output_path, dataset):
 
 
 def dataset_sample_count(dataset):
-    return int(dataset["point_clouds"].shape[0])
+    return int(dataset["joint_features"].shape[0])
 
 
 def empty_dataset_dict(args):
@@ -121,8 +121,9 @@ def empty_dataset_dict(args):
     return dataset
 
 
-def build_dataset_from_transition_results(args, joint_limits_lower, joint_limits_upper, transition_results):
+def build_dataset_from_transition_results(args, joint_limits_lower, joint_limits_upper, transition_results, compact_point_clouds=False):
     point_clouds = []
+    point_cloud_indices = []
     joint_features = []
     collision_labels = []
     min_distance_norm = []
@@ -139,9 +140,21 @@ def build_dataset_from_transition_results(args, joint_limits_lower, joint_limits
         joint_index_in_source = []
 
     for transition_result in transition_results:
+        transition_point_cloud_index = None
+        if compact_point_clouds:
+            for block in transition_result["blocks"]:
+                if block["joint_features"].shape[0] > 0:
+                    point_clouds.append(block["point_cloud"][None, :, :])
+                    transition_point_cloud_index = len(point_clouds) - 1
+                    break
         for block in transition_result["blocks"]:
             count = block["joint_features"].shape[0]
-            point_clouds.append(block["point_clouds"])
+            if compact_point_clouds:
+                if transition_point_cloud_index is None:
+                    continue
+                point_cloud_indices.append(np.full((count,), transition_point_cloud_index, dtype=np.int32))
+            else:
+                point_clouds.append(np.repeat(block["point_cloud"][None, :, :], count, axis=0).astype(np.float32))
             joint_features.append(block["joint_features"])
             collision_labels.append(block["collision_labels"])
             min_distance_norm.append(block["min_distance_norm"])
@@ -163,6 +176,8 @@ def build_dataset_from_transition_results(args, joint_limits_lower, joint_limits
         "collision_labels": concatenate_or_empty(collision_labels, (0,), np.int64),
         "min_distance_norm": concatenate_or_empty(min_distance_norm, (0,), np.float32),
     }
+    if compact_point_clouds:
+        dataset["point_cloud_indices"] = concatenate_or_empty(point_cloud_indices, (0,), np.int32)
     if args.save_metadata:
         dataset.update(
             {
@@ -205,6 +220,7 @@ def write_shard_manifest(manifest_path, args, transition_files, shard_records, t
     payload = {
         "format": "pointcloud_joint_dataset_manifest_v1",
         "required_fields": list(REQUIRED_DATASET_FIELDS),
+        "compact_point_clouds": True,
         "save_metadata": bool(args.save_metadata),
         "results_root": str(Path(args.results_root).resolve()),
         "jobs_root": str(Path(args.jobs_root).resolve()),
@@ -555,7 +571,7 @@ def process_one_transition(
             block = {
                 "source_kind": source_kind,
                 "joint_features": joint_features.astype(np.float32),
-                "point_clouds": np.repeat(point_cloud_input[None, :, :], count, axis=0).astype(np.float32),
+                "point_cloud": point_cloud_input.astype(np.float32),
                 "collision_labels": collision_labels,
                 "min_distance_norm": min_distance_norm,
             }
@@ -687,7 +703,7 @@ def build_dataset(args):
                 )
                 if args.resume and existing_shard_path.is_file():
                     with np.load(existing_shard_path, allow_pickle=True) as existing_data:
-                        shard_sample_count = int(existing_data["point_clouds"].shape[0])
+                        shard_sample_count = int(existing_data["joint_features"].shape[0])
                     shard_records.append(
                         {
                             "transition_index": transition_index_value,
@@ -749,6 +765,7 @@ def build_dataset(args):
                         joint_limits_lower=joint_limits_lower,
                         joint_limits_upper=joint_limits_upper,
                         transition_results=[result],
+                        compact_point_clouds=True,
                     )
                     shard_sample_count = dataset_sample_count(shard_dataset)
                     shard_path = write_transition_shard(args.shard_output_dir, result, shard_dataset)
@@ -771,7 +788,7 @@ def build_dataset(args):
                 else:
                     for block in result["blocks"]:
                         count = block["joint_features"].shape[0]
-                        point_clouds.append(block["point_clouds"])
+                        point_clouds.append(np.repeat(block["point_cloud"][None, :, :], count, axis=0).astype(np.float32))
                         joint_features.append(block["joint_features"])
                         collision_labels.append(block["collision_labels"])
                         min_distance_norm.append(block["min_distance_norm"])
