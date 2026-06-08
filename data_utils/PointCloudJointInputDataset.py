@@ -104,25 +104,37 @@ class PointCloudJointInputDataset(Dataset):
         total_samples = 0
         for record in shard_records:
             shard_path = Path(record["shard_path"]).resolve()
-            shard = np.load(shard_path, allow_pickle=True)
-            self._validate_required(shard, shard_path)
-            point_clouds = np.asarray(shard["point_clouds"], dtype=np.float32)
-            point_cloud_indices = (
-                np.asarray(shard["point_cloud_indices"], dtype=np.int64)
-                if "point_cloud_indices" in shard
-                else None
-            )
-            joint_features = np.asarray(shard["joint_features"], dtype=np.float32)
-            collision_labels = np.asarray(shard["collision_labels"], dtype=np.int64)
-            min_distance_norm = np.asarray(shard["min_distance_norm"], dtype=np.float32)
-            self._validate_shapes(
-                point_clouds,
-                joint_features,
-                collision_labels,
-                min_distance_norm,
-                shard_path,
-                point_cloud_indices=point_cloud_indices,
-            )
+            with np.load(shard_path, allow_pickle=True) as shard:
+                self._validate_required(shard, shard_path)
+                point_clouds = np.asarray(shard["point_clouds"], dtype=np.float32)
+                point_cloud_indices = (
+                    np.asarray(shard["point_cloud_indices"], dtype=np.int64)
+                    if "point_cloud_indices" in shard
+                    else None
+                )
+                joint_features = np.asarray(shard["joint_features"], dtype=np.float32)
+                collision_labels = np.asarray(shard["collision_labels"], dtype=np.int64)
+                min_distance_norm = np.asarray(shard["min_distance_norm"], dtype=np.float32)
+                self._validate_shapes(
+                    point_clouds,
+                    joint_features,
+                    collision_labels,
+                    min_distance_norm,
+                    shard_path,
+                    point_cloud_indices=point_cloud_indices,
+                )
+                metadata_arrays = {}
+                for key in (
+                    "joint_source",
+                    "source_transition_npz",
+                    "source_joint_npz",
+                    "source_workpiece_stl",
+                    "transition_index",
+                    "joint_index_in_source",
+                ):
+                    if key in shard:
+                        metadata_arrays[key] = np.asarray(shard[key])
+
             self.shard_offsets.append(total_samples)
             self.shard_data.append(
                 {
@@ -131,7 +143,7 @@ class PointCloudJointInputDataset(Dataset):
                     "joint_features": joint_features,
                     "collision_labels": collision_labels,
                     "min_distance_norm": min_distance_norm,
-                    "raw": shard,
+                    "metadata": metadata_arrays,
                 }
             )
             self.shard_metadata.append(record)
@@ -172,7 +184,7 @@ class PointCloudJointInputDataset(Dataset):
             joint_feature = shard["joint_features"][local_index]
             collision_label = shard["collision_labels"][local_index]
             min_distance_norm = shard["min_distance_norm"][local_index]
-            data_ref = shard["raw"]
+            data_ref = shard["metadata"]
             index = local_index
         if not self.return_metadata:
             return point_cloud, joint_feature, collision_label, min_distance_norm
