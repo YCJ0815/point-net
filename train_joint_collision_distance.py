@@ -1,5 +1,6 @@
 import argparse
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,7 @@ def parse_args():
     parser.add_argument("--smooth-l1-beta", type=float, default=1.0, help="SmoothL1 beta")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"], help="Training device")
+    parser.add_argument("--log-every", type=int, default=500, help="Print batch progress every N steps; 0 disables batch logging")
     return parser.parse_args()
 
 
@@ -81,7 +83,7 @@ def move_batch(batch, device):
     )
 
 
-def run_epoch(model, criterion, loader, device, optimizer=None):
+def run_epoch(model, criterion, loader, device, optimizer=None, log_every=0, epoch=None, stage="train"):
     training = optimizer is not None
     model.train(training)
     totals = {
@@ -92,10 +94,12 @@ def run_epoch(model, criterion, loader, device, optimizer=None):
         "distance_abs_error": 0.0,
         "samples": 0,
     }
+    total_steps = len(loader)
+    start_time = time.time()
 
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
-        for batch in loader:
+        for step, batch in enumerate(loader, start=1):
             point_cloud, joint_feature, collision_target, distance_target = move_batch(batch, device)
             if training:
                 optimizer.zero_grad()
@@ -117,6 +121,20 @@ def run_epoch(model, criterion, loader, device, optimizer=None):
             totals["distance_loss"] += float(losses["distance_loss"].detach()) * batch_size
             totals["collision_correct"] += int((collision_prediction == collision_truth).sum().item())
             totals["distance_abs_error"] += float(torch.abs(distance_prediction - distance_target).sum().item())
+
+            if log_every > 0 and (step % log_every == 0 or step == total_steps):
+                elapsed = max(time.time() - start_time, 1e-6)
+                steps_per_sec = step / elapsed
+                eta_seconds = (total_steps - step) / max(steps_per_sec, 1e-6)
+                running_loss = totals["loss"] / totals["samples"]
+                prefix = f"epoch {epoch:03d} " if epoch is not None else ""
+                print(
+                    f"{prefix}{stage} step {step}/{total_steps} | "
+                    f"loss {running_loss:.6f} | "
+                    f"steps/s {steps_per_sec:.2f} | "
+                    f"eta_min {eta_seconds / 60.0:.1f}",
+                    flush=True,
+                )
 
     samples = totals["samples"]
     return {
@@ -179,10 +197,29 @@ def main():
     print(f"dataset: {Path(args.dataset).resolve()}")
     print(f"train_samples: {len(train_dataset)}")
     print(f"val_samples: {len(val_dataset)}")
+    print(f"train_steps_per_epoch: {len(train_loader)}")
+    print(f"val_steps_per_epoch: {len(val_loader)}")
 
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, criterion, train_loader, device, optimizer=optimizer)
-        val_metrics = run_epoch(model, criterion, val_loader, device)
+        train_metrics = run_epoch(
+            model,
+            criterion,
+            train_loader,
+            device,
+            optimizer=optimizer,
+            log_every=args.log_every,
+            epoch=epoch,
+            stage="train",
+        )
+        val_metrics = run_epoch(
+            model,
+            criterion,
+            val_loader,
+            device,
+            log_every=args.log_every,
+            epoch=epoch,
+            stage="val",
+        )
         print(
             f"epoch {epoch:03d}/{args.epochs} | "
             f"train_loss {train_metrics['loss']:.6f} | "
