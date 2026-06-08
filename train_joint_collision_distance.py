@@ -27,7 +27,23 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"], help="Training device")
     parser.add_argument("--log-every", type=int, default=500, help="Print batch progress every N steps; 0 disables batch logging")
+    parser.add_argument("--log-file", type=str, default=None, help="Optional training log path; defaults to <output-dir>/training.log")
     return parser.parse_args()
+
+
+class TeeLogger:
+    def __init__(self, log_path):
+        self.log_path = Path(log_path).resolve()
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.log_path.open("a", encoding="utf-8")
+
+    def log(self, message):
+        print(message, flush=True)
+        self.handle.write(message + "\n")
+        self.handle.flush()
+
+    def close(self):
+        self.handle.close()
 
 
 def seed_everything(seed):
@@ -83,7 +99,7 @@ def move_batch(batch, device):
     )
 
 
-def run_epoch(model, criterion, loader, device, optimizer=None, log_every=0, epoch=None, stage="train"):
+def run_epoch(model, criterion, loader, device, optimizer=None, log_every=0, epoch=None, stage="train", logger=None):
     training = optimizer is not None
     model.train(training)
     totals = {
@@ -128,12 +144,11 @@ def run_epoch(model, criterion, loader, device, optimizer=None, log_every=0, epo
                 eta_seconds = (total_steps - step) / max(steps_per_sec, 1e-6)
                 running_loss = totals["loss"] / totals["samples"]
                 prefix = f"epoch {epoch:03d} " if epoch is not None else ""
-                print(
+                logger(
                     f"{prefix}{stage} step {step}/{total_steps} | "
                     f"loss {running_loss:.6f} | "
                     f"steps/s {steps_per_sec:.2f} | "
-                    f"eta_min {eta_seconds / 60.0:.1f}",
-                    flush=True,
+                    f"eta_min {eta_seconds / 60.0:.1f}"
                 )
 
     samples = totals["samples"]
@@ -190,61 +205,69 @@ def main():
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = Path(args.log_file).resolve() if args.log_file else output_dir / "training.log"
+    logger = TeeLogger(log_path)
     best_path = output_dir / "best_model.pth"
     best_val_loss = float("inf")
 
-    print(f"device: {device}")
-    print(f"dataset: {Path(args.dataset).resolve()}")
-    print(f"train_samples: {len(train_dataset)}")
-    print(f"val_samples: {len(val_dataset)}")
-    print(f"train_steps_per_epoch: {len(train_loader)}")
-    print(f"val_steps_per_epoch: {len(val_loader)}")
+    try:
+        logger.log(f"device: {device}")
+        logger.log(f"dataset: {Path(args.dataset).resolve()}")
+        logger.log(f"train_samples: {len(train_dataset)}")
+        logger.log(f"val_samples: {len(val_dataset)}")
+        logger.log(f"train_steps_per_epoch: {len(train_loader)}")
+        logger.log(f"val_steps_per_epoch: {len(val_loader)}")
+        logger.log(f"log_file: {log_path}")
 
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(
-            model,
-            criterion,
-            train_loader,
-            device,
-            optimizer=optimizer,
-            log_every=args.log_every,
-            epoch=epoch,
-            stage="train",
-        )
-        val_metrics = run_epoch(
-            model,
-            criterion,
-            val_loader,
-            device,
-            log_every=args.log_every,
-            epoch=epoch,
-            stage="val",
-        )
-        print(
-            f"epoch {epoch:03d}/{args.epochs} | "
-            f"train_loss {train_metrics['loss']:.6f} | "
-            f"val_loss {val_metrics['loss']:.6f} | "
-            f"val_collision_acc {val_metrics['collision_accuracy']:.4f} | "
-            f"val_distance_mae_norm {val_metrics['distance_mae_norm']:.6f}"
-        )
-
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "best_val_loss": best_val_loss,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "args": vars(args),
-                    "train_metrics": train_metrics,
-                    "val_metrics": val_metrics,
-                },
-                best_path,
+        for epoch in range(1, args.epochs + 1):
+            train_metrics = run_epoch(
+                model,
+                criterion,
+                train_loader,
+                device,
+                optimizer=optimizer,
+                log_every=args.log_every,
+                epoch=epoch,
+                stage="train",
+                logger=logger.log,
+            )
+            val_metrics = run_epoch(
+                model,
+                criterion,
+                val_loader,
+                device,
+                log_every=args.log_every,
+                epoch=epoch,
+                stage="val",
+                logger=logger.log,
+            )
+            logger.log(
+                f"epoch {epoch:03d}/{args.epochs} | "
+                f"train_loss {train_metrics['loss']:.6f} | "
+                f"val_loss {val_metrics['loss']:.6f} | "
+                f"val_collision_acc {val_metrics['collision_accuracy']:.4f} | "
+                f"val_distance_mae_norm {val_metrics['distance_mae_norm']:.6f}"
             )
 
-    print(f"best_checkpoint: {best_path}")
-    print(f"best_val_loss: {best_val_loss:.6f}")
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "best_val_loss": best_val_loss,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "args": vars(args),
+                        "train_metrics": train_metrics,
+                        "val_metrics": val_metrics,
+                    },
+                    best_path,
+                )
+
+        logger.log(f"best_checkpoint: {best_path}")
+        logger.log(f"best_val_loss: {best_val_loss:.6f}")
+    finally:
+        logger.close()
 
 
 if __name__ == "__main__":
