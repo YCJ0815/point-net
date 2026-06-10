@@ -115,7 +115,7 @@ The best validation checkpoint is saved to:
 log/joint_collision_distance/job_003/best_model.pth
 ```
 
-The fusion model is defined in `models/pointnet_joint_collision_distance.py`. It accepts point clouds in either `[B, 512, 3]` or `[B, 3, 512]` format and returns `unsafe_logit`, `d_min_norm`, `z_pc`, `z_q`, and `z_fusion`.
+The fusion model is defined in `models/pointnet_joint_collision_distance.py`. Its point-cloud branch uses a pointwise MLP-style encoder with `3->64->128->256`, `LayerNorm + ReLU` after each layer, max pooling over points, and a final `256->64` projection. It accepts point clouds in either `[B, 512, 3]` or `[B, 3, 512]` format and returns `unsafe_logit`, `d_min_norm`, `z_pc`, `z_q`, and `z_fusion`.
 
 ## Classification (ModelNet10/40)
 ### Data Preparation

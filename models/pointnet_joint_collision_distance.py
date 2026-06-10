@@ -8,11 +8,11 @@ class PointNetFeatureEncoder(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv1d(3, 64, kernel_size=1)
         self.conv2 = nn.Conv1d(64, 128, kernel_size=1)
-        self.conv3 = nn.Conv1d(128, 1024, kernel_size=1)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(1024)
-        self.projection = nn.Linear(1024, 64)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=1)
+        self.norm1 = nn.LayerNorm(64)
+        self.norm2 = nn.LayerNorm(128)
+        self.norm3 = nn.LayerNorm(256)
+        self.projection = nn.Linear(256, 64)
         self.projection_norm = nn.LayerNorm(64)
 
     @staticmethod
@@ -33,11 +33,18 @@ class PointNetFeatureEncoder(nn.Module):
             raise ValueError("point_cloud must contain at least one point")
         return point_cloud.contiguous()
 
+    @staticmethod
+    def _apply_pointwise_block(x, conv, norm):
+        x = conv(x)
+        x = x.transpose(1, 2)
+        x = F.relu(norm(x))
+        return x.transpose(1, 2).contiguous()
+
     def forward(self, point_cloud):
         x = self._to_channel_first(point_cloud)
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.bn3(self.conv3(x))
+        x = self._apply_pointwise_block(x, self.conv1, self.norm1)
+        x = self._apply_pointwise_block(x, self.conv2, self.norm2)
+        x = self._apply_pointwise_block(x, self.conv3, self.norm3)
         x = torch.max(x, dim=2).values
         return F.relu(self.projection_norm(self.projection(x)))
 

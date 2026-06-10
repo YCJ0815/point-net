@@ -1,0 +1,7 @@
+log_path: /Volumes/research/outputs/pretrain_data/training.log
+epochs_plotted: 100
+best_epoch_by_val_loss: 90
+best_train_loss: 0.266715
+best_val_loss: 0.261245
+best_val_collision_acc: 0.8838
+best_val_distance_mae_norm: 0.056634
